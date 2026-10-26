@@ -150,6 +150,7 @@ export function useVoiceInterview() {
   const isSpeakingRef = useRef(false);
   const aiSpeechStartTimeRef = useRef(0);
   const currentAiTextRef = useRef('');
+  const currentMicVolumeRef = useRef(0);
   const rafIdRef = useRef(null);
   const transcriptAccumulatorRef = useRef('');
   const currentInterimRef = useRef('');
@@ -619,48 +620,25 @@ export function useVoiceInterview() {
     setAiResponse(initialLines[0] || text);
 
     // 0. Default Built-In Ultra-Fast Neural Voice (en-US-JennyNeural via /api/tts at 1.1x playback rate)
+    // Synthesizes the complete response in one unbroken audio buffer (~0.7s with JennyNeural) so it NEVER cuts off mid-way!
     if (voiceProvider === 'neural' || voiceProvider === 'browser') {
       try {
-        const sentences = text
-          .match(/[^.!?]+[.!?]+(?:\s|$)|[^.!?]+$/g)
-          ?.map(s => s.trim())
-          .filter(Boolean) || [text];
+        const response = await fetch('/api/tts', {
+          method: 'POST',
+          signal: controller.signal,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text,
+            voice: neuralVoice || 'en-US-JennyNeural'
+          })
+        });
 
-        const fetchSentenceAudio = async (sentenceText) => {
-          const response = await fetch('/api/tts', {
-            method: 'POST',
-            signal: controller.signal,
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              text: sentenceText,
-              voice: neuralVoice || 'en-US-JennyNeural'
-            })
-          });
-          if (!response.ok) return null;
-          const buf = await response.arrayBuffer();
-          return buf && buf.byteLength > 300 ? buf : null;
-        };
-
-        if (sentences.length <= 1) {
-          const buffer = await fetchSentenceAudio(text);
-          if (buffer && isSessionActiveRef.current && isSpeakingRef.current) {
+        if (response.ok && isSessionActiveRef.current && isSpeakingRef.current) {
+          const buffer = await response.arrayBuffer();
+          if (buffer && buffer.byteLength > 300 && isSessionActiveRef.current && isSpeakingRef.current) {
             await playAudioBuffer(buffer, text);
             return;
           }
-        } else {
-          // Prefetch all sentences in parallel so each sentence plays seamlessly with line-by-line movie subtitles!
-          const audioPromises = sentences.map(s => fetchSentenceAudio(s));
-          for (let i = 0; i < sentences.length; i++) {
-            if (!isSessionActiveRef.current || !isSpeakingRef.current) return;
-            const sentenceBuffer = await audioPromises[i];
-            if (sentenceBuffer && isSessionActiveRef.current && isSpeakingRef.current) {
-              await playSingleBufferWithSubtitles(sentenceBuffer, sentences[i]);
-            }
-          }
-          if (isSessionActiveRef.current && isSpeakingRef.current) {
-            resumeListeningAfterAiSpeech();
-          }
-          return;
         }
       } catch (err) {
         if (err.name === 'AbortError' || !isSessionActiveRef.current) return;
@@ -1186,15 +1164,16 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
         }
         const average = sum / dataArray.length;
         const normalized = Math.min(average / 128, 1);
+        currentMicVolumeRef.current = normalized;
 
         const now = Date.now();
 
         // Only detect Barge-In via sustained human speech on mobile (where WebSpeech isn't running)
-        // Requires 18+ consecutive frames (~300ms) of strong human voice (>0.25) so slight noises/taps never interrupt!
+        // Requires 24+ consecutive frames (~400ms) of strong close-mic human voice (>0.32) so speaker audio never interrupts!
         if (isSpeakingRef.current) {
-          if (isMobileDevice && now - aiSpeechStartTimeRef.current > 800 && normalized > 0.25) {
+          if (isMobileDevice && now - aiSpeechStartTimeRef.current > 1200 && normalized > 0.32) {
             bargeInFrames++;
-            if (bargeInFrames >= 18) {
+            if (bargeInFrames >= 24) {
               bargeInFrames = 0;
               interruptAiSpeech(true);
               lastVoiceTime = now;
@@ -1314,18 +1293,29 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
       const incomingSpeech = (newlyFinal + ' ' + interim).trim();
 
       // If AI is currently speaking and user starts talking:
-      // Only interrupt when Web Speech recognizes an actual spoken phrase (at least 2 real words or a clear spoken command >= 6 chars),
-      // so background noises, coughs, or single-syllable mic pops NEVER cut off the AI!
+      // Only interrupt when Web Speech recognizes an actual spoken phrase from the user (not speaker echo or room noise),
+      // so background noises, coughs, or speaker bleed from the AI's own voice NEVER cut off the AI mid-sentence!
       if (isSpeakingRef.current) {
-        const words = incomingSpeech.split(/\s+/).filter(w => w.length >= 2);
-        const isRealSpokenPhrase = words.length >= 2 || incomingSpeech.length >= 8;
+        const cleanWords = incomingSpeech
+          .toLowerCase()
+          .replace(/[^a-z0-9\s]/g, ' ')
+          .split(/\s+/)
+          .filter(w => w.length >= 2);
+
+        const isRealSpokenPhrase = cleanWords.length >= 3 || (cleanWords.length >= 2 && incomingSpeech.length >= 10);
         if (!isRealSpokenPhrase) return;
 
-        // Ignore if mic picked up a snippet of the AI's own sentence
-        const normIncoming = incomingSpeech.toLowerCase().trim();
-        const isEchoOfAi = currentAiTextRef.current.includes(normIncoming);
+        // Require actual physical microphone volume above room/speaker bleed level
+        if (currentMicVolumeRef.current < 0.14) return;
 
-        if (isEchoOfAi) return;
+        // Ignore if mic picked up a snippet or echo of the AI's own sentence (even with slightly different punctuation)
+        const cleanAiText = (currentAiTextRef.current || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ');
+        const cleanIncoming = cleanWords.join(' ');
+        if (cleanAiText.includes(cleanIncoming)) return;
+
+        const aiWordSet = new Set(cleanAiText.split(/\s+/).filter(Boolean));
+        const matchingAiWords = cleanWords.filter(w => aiWordSet.has(w)).length;
+        if (cleanWords.length > 0 && matchingAiWords / cleanWords.length >= 0.5) return;
 
         // Genuine spoken phrase from user! Stop AI voice immediately and capture user's new speech!
         killAllVoiceOutput();

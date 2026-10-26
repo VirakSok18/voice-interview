@@ -1,20 +1,18 @@
 import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
 
-// Reuse a warm singleton WebSocket connection with ultra-low-latency en-US-JennyNeural (~220ms first chunk!)
-let sharedTts = null;
-let currentVoice = null;
+const BLOCKED_TTS_PATTERNS = [
+  /\b(kill|killing|murder|assassinate|slaughter|bomb|explosive|terrorist|terrorism|massacre|torture|suicide|suicidal|self[\s-]*harm)\b/i,
+  /\b(sex|sexual|porn|pornography|nsfw|nude|naked|erotic|fetish|orgasm|masturbat|prostitut|rape|molest|incest|pedophil|hentai|blowjob|handjob|penis|vagina|dildo)\b/i,
+  /\b(cocaine|heroin|methamphetamine|fentanyl|human\s*trafficking|ransomware|child\s*abuse|nazi|white\s*supremac|racial\s*slur|nigger|faggot|fuck\s*you|motherfucker|cunt)\b/i
+];
 
-async function getReadyTts(voice) {
-  if (!sharedTts || currentVoice !== voice) {
-    sharedTts = new MsEdgeTTS();
-    await sharedTts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
-    currentVoice = voice;
-  }
-  return sharedTts;
-}
+const SAFE_FALLBACK_TEXT =
+  "I am strictly a professional job interview and career learning assistant. Let's return to practicing for your job interview.";
 
+// Dedicated per-request MsEdgeTTS instance so parallel/consecutive requests NEVER collide or cut off mid-sentence!
 async function synthesizeBuffer(text, voice) {
-  const tts = await getReadyTts(voice);
+  const tts = new MsEdgeTTS();
+  await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
   const { audioStream } = tts.toStream(text);
   const chunks = [];
 
@@ -24,17 +22,12 @@ async function synthesizeBuffer(text, voice) {
     audioStream.on('error', reject);
   });
 
+  try {
+    tts.close();
+  } catch (_) {}
+
   return Buffer.concat(chunks);
 }
-
-const BLOCKED_TTS_PATTERNS = [
-  /\b(kill|killing|murder|assassinate|slaughter|bomb|explosive|terrorist|terrorism|massacre|torture|suicide|suicidal|self[\s-]*harm)\b/i,
-  /\b(sex|sexual|porn|pornography|nsfw|nude|naked|erotic|fetish|orgasm|masturbat|prostitut|rape|molest|incest|pedophil|hentai|blowjob|handjob|penis|vagina|dildo)\b/i,
-  /\b(cocaine|heroin|methamphetamine|fentanyl|human\s*trafficking|ransomware|child\s*abuse|nazi|white\s*supremac|racial\s*slur|nigger|faggot|fuck\s*you|motherfucker|cunt)\b/i
-];
-
-const SAFE_FALLBACK_TEXT =
-  "I am strictly a professional job interview and career learning assistant. Let's return to practicing for your job interview.";
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -62,7 +55,6 @@ export default async function handler(req, res) {
     try {
       audioBuffer = await synthesizeBuffer(text, voice);
     } catch (_) {
-      sharedTts = null;
       audioBuffer = await synthesizeBuffer(text, voice);
     }
 
@@ -72,7 +64,6 @@ export default async function handler(req, res) {
     return res.status(200).send(audioBuffer);
   } catch (err) {
     console.error('Edge Neural TTS error:', err);
-    sharedTts = null;
     return res.status(500).json({ error: 'Failed to synthesize neural speech' });
   }
 }
