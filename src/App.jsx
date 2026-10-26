@@ -37,8 +37,23 @@ export default function App() {
   // Current active subtitle text to display below the bubble
   const liveUserText = `${transcript} ${interimTranscript}`.trim();
 
+  // Dynamic font sizing so even long explanations always fit inside the display cleanly
+  const getDynamicSubtitleClass = (text) => {
+    const len = (text || '').length;
+    if (len > 340) {
+      return 'text-xs sm:text-sm leading-snug';
+    }
+    if (len > 220) {
+      return 'text-sm sm:text-base leading-normal';
+    }
+    if (len > 120) {
+      return 'text-base sm:text-lg leading-relaxed';
+    }
+    return 'text-lg sm:text-2xl leading-relaxed';
+  };
+
   return (
-    <main className="relative w-screen h-[100dvh] overflow-hidden bg-[#06080f] text-slate-100 flex flex-col items-center justify-center px-6 select-none">
+    <main className="relative w-screen h-[100dvh] overflow-hidden bg-[#06080f] text-slate-100 flex flex-col items-center justify-between py-8 sm:py-12 px-5 select-none">
       {/* Subtle Ambient Glow */}
       <div
         className="pointer-events-none absolute inset-0 z-0"
@@ -85,7 +100,7 @@ export default function App() {
           + New interview
         </button>
 
-        {/* Clean List of Past Interviews (No icons, no extra subtitle text, no bright colors) */}
+        {/* Clean List of Past Interviews */}
         <div className="flex-1 overflow-y-auto space-y-1">
           {sessions.map((session) => {
             const isSelected = session.id === activeSessionId;
@@ -124,7 +139,10 @@ export default function App() {
         </div>
       </aside>
 
-      {/* Center Interactive 3D Voice Bubble (Tap to Start / Tap to Close Voice) */}
+      {/* Top Balance Spacer */}
+      <div className="h-4 shrink-0" />
+
+      {/* Center Interactive 3D Voice Bubble (Scales responsively to leave plenty of room for subtitles) */}
       <div
         onClick={handleOrbClick}
         role="button"
@@ -133,13 +151,13 @@ export default function App() {
           if (e.key === 'Enter' || e.key === ' ') handleOrbClick();
         }}
         aria-label={isSessionActive ? 'Tap bubble to stop voice' : 'Tap bubble to start talking'}
-        className="relative z-10 w-full max-w-[340px] sm:max-w-[440px] aspect-square flex items-center justify-center cursor-pointer transition-transform duration-300 active:scale-95"
+        className="relative z-10 w-full max-w-[270px] sm:max-w-[380px] max-h-[46dvh] aspect-square flex items-center justify-center cursor-pointer transition-transform duration-300 active:scale-95 shrink-0"
       >
         <VoiceOrb status={status} audioLevel={audioLevel} />
       </div>
 
-      {/* Floating Clean Text-Only Subtitles Directly Below Bubble (No Box or Background) */}
-      <div className="relative z-20 w-full max-w-2xl min-h-[6.5rem] flex flex-col items-center justify-start text-center mt-2 px-4 pointer-events-none">
+      {/* Dynamic Auto-Scaling Subtitle Area Directly Below Bubble (Always fits inside viewport!) */}
+      <div className="relative z-20 w-full max-w-2xl h-[34dvh] max-h-[34dvh] flex flex-col items-center justify-center text-center px-3 overflow-y-auto">
         {!isSessionActive ? (
           <p className="text-base sm:text-xl text-slate-400 font-medium tracking-wide">
             {customRoleTitle && history.length > 0
@@ -147,11 +165,15 @@ export default function App() {
               : 'Tap the bubble to start talking'}
           </p>
         ) : micWarning ? (
-          <p className="text-base sm:text-lg text-amber-300 font-medium leading-relaxed">
+          <p className="text-sm sm:text-base text-amber-300 font-medium leading-relaxed">
             {micWarning}
           </p>
         ) : liveUserText ? (
-          <p className="text-xl sm:text-2xl text-emerald-300 font-semibold leading-relaxed tracking-tight drop-shadow-[0_2px_12px_rgba(0,0,0,0.9)]">
+          <p
+            className={`${getDynamicSubtitleClass(
+              liveUserText
+            )} text-emerald-300 font-semibold tracking-tight break-words drop-shadow-[0_2px_12px_rgba(0,0,0,0.9)] transition-all duration-150`}
+          >
             {liveUserText}
           </p>
         ) : status === 'thinking' ? (
@@ -159,7 +181,11 @@ export default function App() {
             ...
           </p>
         ) : aiResponse ? (
-          <p className="text-xl sm:text-2xl text-white font-semibold leading-relaxed tracking-tight drop-shadow-[0_2px_14px_rgba(0,0,0,0.95)]">
+          <p
+            className={`${getDynamicSubtitleClass(
+              aiResponse
+            )} text-white font-semibold tracking-tight break-words drop-shadow-[0_2px_14px_rgba(0,0,0,0.95)] transition-all duration-150`}
+          >
             {aiResponse}
           </p>
         ) : (
