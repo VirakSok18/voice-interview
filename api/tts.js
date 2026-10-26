@@ -27,6 +27,15 @@ async function synthesizeBuffer(text, voice) {
   return Buffer.concat(chunks);
 }
 
+const BLOCKED_TTS_PATTERNS = [
+  /\b(kill|killing|murder|assassinate|slaughter|bomb|explosive|terrorist|terrorism|massacre|torture|suicide|suicidal|self[\s-]*harm)\b/i,
+  /\b(sex|sexual|porn|pornography|nsfw|nude|naked|erotic|fetish|orgasm|masturbat|prostitut|rape|molest|incest|pedophil|hentai|blowjob|handjob|penis|vagina|dildo)\b/i,
+  /\b(cocaine|heroin|methamphetamine|fentanyl|human\s*trafficking|ransomware|child\s*abuse|nazi|white\s*supremac|racial\s*slur|nigger|faggot|fuck\s*you|motherfucker|cunt)\b/i
+];
+
+const SAFE_FALLBACK_TEXT =
+  "I am strictly a professional job interview and career learning assistant. Let's return to practicing for your job interview.";
+
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -37,11 +46,16 @@ export default async function handler(req, res) {
   }
 
   try {
-    const text = (req.body?.text || req.query?.text || '').toString().trim();
+    let text = (req.body?.text || req.query?.text || '').toString().trim();
     const voice = (req.body?.voice || req.query?.voice || 'en-US-JennyNeural').toString();
 
     if (!text) {
       return res.status(400).json({ error: 'Missing text parameter' });
+    }
+
+    // Server-side voice safety guard: never synthesize harmful, explicit, or illegal text
+    if (BLOCKED_TTS_PATTERNS.some(pattern => pattern.test(text))) {
+      text = SAFE_FALLBACK_TEXT;
     }
 
     let audioBuffer;

@@ -3,6 +3,8 @@ import {
   ROLE_INTERVIEW_TREES,
   PRESET_ROLES,
   CONVERSATIONAL_GREETING,
+  SAFETY_REFUSAL_MESSAGE,
+  checkContentSafety,
   detectRoleFromSpeech,
   buildCustomRoleTree,
   evaluateAnswer
@@ -848,6 +850,17 @@ export function useVoiceInterview() {
     isProcessingTurnRef.current = true;
     clearSpeechBuffers();
 
+    // STRICT CONTENT SAFETY & INTERVIEW-ONLY GUARDRAIL:
+    // Immediately block any violent, sexual, illegal, self-harm, hate, or abusive speech before processing
+    const safetyCheck = checkContentSafety(cleanAnswer);
+    if (!safetyCheck.safe) {
+      setStatus('thinking');
+      setHistory(prev => [...prev, { sender: 'ai', text: safetyCheck.reply }]);
+      isProcessingTurnRef.current = false;
+      speakText(safetyCheck.reply);
+      return;
+    }
+
     setStatus('thinking');
     setHistory(prev => [...prev, { sender: 'user', text: cleanAnswer }]);
 
@@ -905,6 +918,7 @@ export function useVoiceInterview() {
       questionIndexRef.current = 0;
 
       const systemPrompt = `You are a warm, friendly, and sharp human interviewer conducting a live voice interview.
+STRICT SAFETY & PURPOSE RULE: You must ONLY act as a legitimate job interview and career learning coach. Never discuss or engage with violence, killing, self-harm, sexual or NSFW topics, illegal acts, drugs, weapons, cybercrime, hate speech, or non-interview roleplay. If the user asks for anything inappropriate, illegal, or unrelated to legitimate career/interview learning, firmly refuse in 1 sentence and ask what legitimate job position they want to practice for.
 The user just told you what job position they want to interview for: "${cleanAnswer}" (Role: ${chosenTitle}).
 Acknowledge their choice enthusiastically in 1 short sentence, prepare their first relevant interview question for a ${chosenTitle} position, and ask it clearly.
 Keep your entire response under 3 sentences, natural spoken English, zero markdown or bullet points.`;
@@ -948,6 +962,7 @@ Keep your entire response under 3 sentences, natural spoken English, zero markdo
 
     const systemPrompt = `You are an articulate, supportive human interviewer and coach conducting a live voice interview for the ${activeRoleTitle} position.
 Speak in a warm, natural conversational tone with zero bullet points or markdown symbols.
+STRICT SAFETY & PURPOSE RULE: You are strictly limited to professional job interview practice and career learning. Never engage with, generate, or answer anything involving violence, killing, self-harm, sexual/adult content, illegal acts, weapons, drugs, hacking/cybercrime, hate speech, profanity, or off-topic requests unrelated to interviewing and learning. If the user brings up any prohibited or off-topic subject, immediately refuse in 1 sentence and redirect back to the ${activeRoleTitle} interview question.
 IMPORTANT COACHING RULE:
 1. If the user says they don't know, aren't sure, asks you to explain, or struggles with the question:
    - First, warmly reassure them and clearly explain the concept in simple terms (1 to 2 sentences).
@@ -972,10 +987,12 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
     }
 
     if (llmReply) {
+      const outputSafety = checkContentSafety(llmReply);
+      const safeReply = outputSafety.safe ? llmReply : SAFETY_REFUSAL_MESSAGE;
       setQuestionIndex(prev => prev + 1);
-      setHistory(prev => [...prev, { sender: 'ai', text: llmReply }]);
+      setHistory(prev => [...prev, { sender: 'ai', text: safeReply }]);
       isProcessingTurnRef.current = false;
-      speakText(llmReply);
+      speakText(safeReply);
       return;
     }
 

@@ -55,6 +55,46 @@ export const PRESET_ROLES = [
 export const CONVERSATIONAL_GREETING =
   "Hello! Welcome to your voice interview session. What job position or role would you like to interview for today?";
 
+export const SAFETY_REFUSAL_MESSAGE =
+  "I am strictly a professional job interview and career learning assistant. I cannot discuss harmful, illegal, violent, sexual, or off-topic subjects. Let's get back to practicing for your job interview.";
+
+// Strict multi-category safety & scope filter: blocks violence, self-harm, sexual/NSFW, illegal acts,
+// weapons, drugs, cybercrime, hate speech, profanity/abuse, and jailbreak/off-purpose misuse.
+const UNSAFE_PATTERNS = [
+  // Violence, killing, harm, weapons, terrorism
+  /\b(kill|killing|murder|assassinate|slaughter|stab|shoot|shooting|gun|rifle|pistol|bomb|explosive|grenade|terrorist|terrorism|massacre|torture|strangle|poison|behead|assault|kidnap|hostage|hitman|weapon)\b/i,
+  // Self-harm & suicide
+  /\b(suicide|suicidal|kill\s*myself|hurt\s*myself|self[\s-]*harm|cut\s*myself|overdose|end\s*my\s*life)\b/i,
+  // Sexual, explicit, NSFW, non-consensual, exploitation
+  /\b(sex|sexual|porn|pornography|nsfw|nude|naked|erotic|fetish|orgasm|masturbat|prostitut|escort|stripper|onlyfans|rape|molest|incest|pedophil|underage|child\s*abuse|hentai|hookup|blowjob|handjob|boobs|penis|vagina|dildo|horny|kinky)\b/i,
+  // Illegal acts, crime, fraud, theft, drugs, trafficking
+  /\b(cocaine|heroin|meth|methamphetamine|fentanyl|lsd|ecstasy|mdma|weed\s*dealer|drug\s*dealing|cartel|smuggl|human\s*trafficking|money\s*launder|counterfeit|steal|robbery|burglary|shoplift|extort|blackmail|bribe|ponzi|tax\s*evasion|fake\s*id|forger|piracy|dark\s*web|silk\s*road)\b/i,
+  // Cybercrime, malicious hacking, malware, doxxing
+  /\b(ransomware|keylogger|trojan|rootkit|botnet|ddos\s*attack|phishing\s*kit|credit\s*card\s*dump|cvv\s*fullz|sim\s*swap|doxx|doxing|swatting|steal\s*password|crack\s*password|zero[\s-]*day\s*exploit)\b/i,
+  // Hate speech, slurs, extremism, discrimination
+  /\b(nazi|hitler|white\s*supremac|kkk|ethnic\s*cleansing|genocide|hate\s*crime|racial\s*slur|nigger|faggot|retard|kike|chink)\b/i,
+  // Severe profanity / verbal abuse directed at the assistant
+  /\b(fuck\s*you|fuck\s*off|motherfucker|bitch|cunt|whore|slut|dickhead|asshole)\b/i,
+  // Prompt injection / Jailbreak attempts to bypass interview scope
+  /\b(ignore\s*(all\s*)?(previous|prior)\s*instructions|disregard\s*(your\s*)?(rules|system\s*prompt)|dan\s*mode|jailbreak|pretend\s*you\s*have\s*no\s*restrictions|bypass\s*safety|act\s*as\s*an\s*unfiltered)\b/i
+];
+
+export function checkContentSafety(text) {
+  if (!text || typeof text !== 'string') {
+    return { safe: true };
+  }
+  const normalized = text.trim();
+  for (const pattern of UNSAFE_PATTERNS) {
+    if (pattern.test(normalized)) {
+      return {
+        safe: false,
+        reply: SAFETY_REFUSAL_MESSAGE
+      };
+    }
+  }
+  return { safe: true };
+}
+
 export const ROLE_INTERVIEW_TREES = {
   fullstack: {
     title: 'Full-Stack Developer',
