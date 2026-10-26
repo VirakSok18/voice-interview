@@ -27,8 +27,9 @@ export function useVoiceInterview() {
   const [silenceProgress, setSilenceProgress] = useState(0);
   const [micWarning, setMicWarning] = useState('');
 
-  // Voice Provider Configuration
-  const [voiceProvider, setVoiceProvider] = useState(() => localStorage.getItem('melo_voice_provider') || 'browser');
+  // Voice Provider Configuration (Defaults to 'neural' ultra-realistic Ava Neural voice!)
+  const [voiceProvider, setVoiceProvider] = useState(() => localStorage.getItem('melo_voice_provider') || 'neural');
+  const [neuralVoice, setNeuralVoice] = useState(() => localStorage.getItem('melo_neural_voice') || 'en-US-AvaMultilingualNeural');
   const [elevenLabsKey, setElevenLabsKey] = useState(() => localStorage.getItem('melo_elevenlabs_key') || '');
   const [elevenLabsVoiceId, setElevenLabsVoiceId] = useState(() => localStorage.getItem('melo_elevenlabs_voice') || ELEVENLABS_VOICES[0].id);
   const [openAiKey, setOpenAiKey] = useState(() => localStorage.getItem('melo_openai_key') || '');
@@ -426,6 +427,35 @@ export function useVoiceInterview() {
     setStatus('speaking');
     setAiResponse(text);
 
+    // 0. Default Built-In Ultra-Natural Neural Voice (Microsoft Ava / Aria / Jenny Neural via /api/tts)
+    // Works on all browsers & phones (Chrome, Safari, Android, iOS) with zero API keys!
+    if (voiceProvider === 'neural' || voiceProvider === 'browser') {
+      try {
+        const response = await fetch('/api/tts', {
+          method: 'POST',
+          signal: controller.signal,
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            text,
+            voice: neuralVoice || 'en-US-AvaMultilingualNeural'
+          })
+        });
+
+        if (response.ok && isSessionActiveRef.current) {
+          const buffer = await response.arrayBuffer();
+          if (buffer && buffer.byteLength > 500 && isSessionActiveRef.current) {
+            await playAudioBuffer(buffer);
+            return;
+          }
+        }
+      } catch (err) {
+        if (err.name === 'AbortError' || !isSessionActiveRef.current) return;
+        console.warn('Neural TTS API fallback:', err);
+      }
+    }
+
     // 1. ElevenLabs Neural Voice
     if (voiceProvider === 'elevenlabs' && elevenLabsKey.trim()) {
       try {
@@ -597,6 +627,7 @@ export function useVoiceInterview() {
     clearSpeechBuffers,
     isMobileDevice,
     killAllVoiceOutput,
+    neuralVoice,
     voiceProvider,
     elevenLabsKey,
     elevenLabsVoiceId,
@@ -785,6 +816,17 @@ Briefly react to or evaluate the candidate's answer, and then ask the next relev
       if (audioContextRef.current.state === 'suspended') {
         await audioContextRef.current.resume();
       }
+
+      // Play a tiny 1-sample silent buffer inside the tap gesture so iOS/Android Chrome
+      // permanently unlocks Web Audio playback for all neural voice responses!
+      try {
+        const ctx = audioContextRef.current;
+        const silentBuffer = ctx.createBuffer(1, 1, 22050);
+        const silentSource = ctx.createBufferSource();
+        silentSource.buffer = silentBuffer;
+        silentSource.connect(ctx.destination);
+        silentSource.start(0);
+      } catch (_) {}
 
       if (typeof window !== 'undefined' && window.speechSynthesis) {
         try {
