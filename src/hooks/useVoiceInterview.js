@@ -11,10 +11,30 @@ import {
 } from '../services/interviewKnowledge';
 import { ELEVENLABS_VOICES } from '../services/voiceProviders';
 
-const SILENCE_SUBMIT_MS = 1600; // 1.6s silence detection after speech ends
+const SILENCE_SUBMIT_MS = 1200; // 1.2s snappy silence detection after speech ends
 const SESSIONS_STORAGE_KEY = 'voice_interview_sessions_v2';
 const ACTIVE_SESSION_COOKIE = 'voice_interview_active_id_v2';
 const VOICE_PLAYBACK_RATE = 1.1; // Tiny bit faster (1.1x) for natural, brisk interviewer cadence
+
+// Splits a response into natural sentences for ultra-low-latency pipelined audio playback
+function splitIntoSentences(text) {
+  const cleaned = text.trim();
+  if (!cleaned) return [];
+  const raw = cleaned.match(/[^.!?]+[.!?]+(?:\s|$)|[^.!?]+$/g);
+  if (!raw) return [cleaned];
+
+  const merged = [];
+  for (const part of raw) {
+    const s = part.trim();
+    if (!s) continue;
+    if (merged.length > 0 && s.length < 18) {
+      merged[merged.length - 1] += ' ' + s;
+    } else {
+      merged.push(s);
+    }
+  }
+  return merged.length > 0 ? merged : [cleaned];
+}
 
 // Splits a sentence into short movie-style subtitle lines (~8 words per line)
 function splitIntoMovieLines(sentenceText) {
@@ -620,23 +640,42 @@ export function useVoiceInterview() {
     setAiResponse(initialLines[0] || text);
 
     // 0. Default Built-In Ultra-Fast Neural Voice (en-US-JennyNeural via /api/tts at 1.1x playback rate)
-    // Synthesizes the complete response in one unbroken audio buffer (~0.7s with JennyNeural) so it NEVER cuts off mid-way!
+    // Pipelined sentence synthesis: starts playing sentence 1 immediately (~0.35s) while sentence 2 fetches in the background!
     if (voiceProvider === 'neural' || voiceProvider === 'browser') {
       try {
-        const response = await fetch('/api/tts', {
-          method: 'POST',
-          signal: controller.signal,
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            text,
-            voice: neuralVoice || 'en-US-JennyNeural'
-          })
-        });
+        const sentences = splitIntoSentences(text);
+        if (sentences.length > 0) {
+          const fetchSentenceAudio = async (sentence) => {
+            const response = await fetch('/api/tts', {
+              method: 'POST',
+              signal: controller.signal,
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                text: sentence,
+                voice: neuralVoice || 'en-US-JennyNeural'
+              })
+            });
+            if (!response.ok) throw new Error(`TTS status ${response.status}`);
+            const buffer = await response.arrayBuffer();
+            if (!buffer || buffer.byteLength < 300) throw new Error('Empty TTS buffer');
+            return buffer;
+          };
 
-        if (response.ok && isSessionActiveRef.current && isSpeakingRef.current) {
-          const buffer = await response.arrayBuffer();
-          if (buffer && buffer.byteLength > 300 && isSessionActiveRef.current && isSpeakingRef.current) {
-            await playAudioBuffer(buffer, text);
+          const audioPromises = sentences.map(s => fetchSentenceAudio(s));
+          let playedAny = false;
+
+          for (let i = 0; i < audioPromises.length; i++) {
+            if (!isSessionActiveRef.current || !isSpeakingRef.current) return;
+            const buffer = await audioPromises[i];
+            if (!isSessionActiveRef.current || !isSpeakingRef.current) return;
+            playedAny = true;
+            await playSingleBufferWithSubtitles(buffer, sentences[i]);
+          }
+
+          if (playedAny) {
+            if (isSessionActiveRef.current && isSpeakingRef.current) {
+              resumeListeningAfterAiSpeech();
+            }
             return;
           }
         }
