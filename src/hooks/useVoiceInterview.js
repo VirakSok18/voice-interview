@@ -14,6 +14,32 @@ const SESSIONS_STORAGE_KEY = 'voice_interview_sessions_v2';
 const ACTIVE_SESSION_COOKIE = 'voice_interview_active_id_v2';
 const VOICE_PLAYBACK_RATE = 1.1; // Tiny bit faster (1.1x) for natural, brisk interviewer cadence
 
+// Splits a sentence into short movie-style subtitle lines (~8 words per line)
+function splitIntoMovieLines(sentenceText) {
+  const words = sentenceText.trim().split(/\s+/).filter(Boolean);
+  if (words.length <= 9) return [sentenceText.trim()];
+
+  const lines = [];
+  let current = [];
+  for (let i = 0; i < words.length; i++) {
+    current.push(words[i]);
+    const word = words[i];
+    const endsWithClause = /[,;:—–-]$/.test(word);
+    if ((current.length >= 6 && endsWithClause) || current.length >= 9) {
+      lines.push(current.join(' '));
+      current = [];
+    }
+  }
+  if (current.length > 0) {
+    if (current.length <= 2 && lines.length > 0) {
+      lines[lines.length - 1] += ' ' + current.join(' ');
+    } else {
+      lines.push(current.join(' '));
+    }
+  }
+  return lines;
+}
+
 function loadSavedSessions() {
   try {
     const raw = localStorage.getItem(SESSIONS_STORAGE_KEY);
@@ -116,6 +142,7 @@ export function useVoiceInterview() {
   const fakeVolumeIntervalRef = useRef(null);
   const chromeKeepAliveTimerRef = useRef(null);
   const ttsFallbackTimeoutRef = useRef(null);
+  const subtitleTimersRef = useRef([]);
   const abortControllerRef = useRef(null);
 
   const isSpeakingRef = useRef(false);
@@ -299,6 +326,10 @@ export function useVoiceInterview() {
       clearTimeout(ttsFallbackTimeoutRef.current);
       ttsFallbackTimeoutRef.current = null;
     }
+    if (subtitleTimersRef.current.length > 0) {
+      subtitleTimersRef.current.forEach(t => clearTimeout(t));
+      subtitleTimersRef.current = [];
+    }
 
     if (typeof window !== 'undefined' && window.speechSynthesis) {
       try {
@@ -412,63 +443,100 @@ export function useVoiceInterview() {
     }
   }, [isMobileDevice]);
 
-  // Play audio array buffer via Web Audio API at 1.1x speed (tiny bit faster!)
-  const playAudioBuffer = useCallback(async (arrayBuffer) => {
-    if (!isSessionActiveRef.current || !audioContextRef.current) {
-      resumeListeningAfterAiSpeech();
-      return;
-    }
-    const ctx = audioContextRef.current;
-    if (ctx.state === 'suspended') {
-      await ctx.resume();
-    }
+  // Play an audio buffer and synchronize movie-style subtitle lines to the exact audio duration!
+  const playSingleBufferWithSubtitles = useCallback((arrayBuffer, chunkText) => {
+    return new Promise(async (resolve) => {
+      if (!isSessionActiveRef.current || !isSpeakingRef.current || !audioContextRef.current) {
+        return resolve();
+      }
+      const ctx = audioContextRef.current;
+      if (ctx.state === 'suspended') {
+        try { await ctx.resume(); } catch (_) {}
+      }
 
-    try {
-      const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
-      if (!isSessionActiveRef.current) return;
+      try {
+        const audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+        if (!isSessionActiveRef.current || !isSpeakingRef.current) return resolve();
 
-      const source = ctx.createBufferSource();
-      source.buffer = audioBuffer;
-      source.playbackRate.value = VOICE_PLAYBACK_RATE; // 1.1x slightly faster!
+        const source = ctx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.playbackRate.value = VOICE_PLAYBACK_RATE;
 
-      const ttsAnalyser = ctx.createAnalyser();
-      ttsAnalyser.fftSize = 256;
-      source.connect(ttsAnalyser);
-      ttsAnalyser.connect(ctx.destination);
+        const ttsAnalyser = ctx.createAnalyser();
+        ttsAnalyser.fftSize = 256;
+        source.connect(ttsAnalyser);
+        ttsAnalyser.connect(ctx.destination);
 
-      activeAudioSourceRef.current = source;
-      isSpeakingRef.current = true;
-      setStatus('speaking');
+        activeAudioSourceRef.current = source;
+        isSpeakingRef.current = true;
+        setStatus('speaking');
 
-      const ttsData = new Uint8Array(ttsAnalyser.frequencyBinCount);
-      if (ttsPulseIntervalRef.current) clearInterval(ttsPulseIntervalRef.current);
-      ttsPulseIntervalRef.current = setInterval(() => {
-        if (!isSpeakingRef.current || !isSessionActiveRef.current) {
-          clearInterval(ttsPulseIntervalRef.current);
-          ttsPulseIntervalRef.current = null;
-          return;
+        // Schedule movie-style line-by-line subtitles synced to the exact spoken duration of this audio buffer!
+        if (subtitleTimersRef.current.length > 0) {
+          subtitleTimersRef.current.forEach(t => clearTimeout(t));
+          subtitleTimersRef.current = [];
         }
-        ttsAnalyser.getByteFrequencyData(ttsData);
-        let s = 0;
-        for (let i = 0; i < ttsData.length; i++) s += ttsData[i];
-        setAudioLevel(Math.min((s / ttsData.length) / 100, 1));
-      }, 50);
 
-      source.onended = () => {
-        if (ttsPulseIntervalRef.current) {
-          clearInterval(ttsPulseIntervalRef.current);
-          ttsPulseIntervalRef.current = null;
+        const lines = splitIntoMovieLines(chunkText || '');
+        const effectiveDurationMs = (audioBuffer.duration / VOICE_PLAYBACK_RATE) * 1000;
+        const totalChars = lines.reduce((sum, l) => sum + l.length, 0) || 1;
+
+        if (lines.length > 0) {
+          setAiResponse(lines[0]);
+          let elapsedMs = 0;
+          for (let i = 0; i < lines.length; i++) {
+            const lineDuration = (lines[i].length / totalChars) * effectiveDurationMs;
+            if (i > 0) {
+              const lineText = lines[i];
+              const timerId = setTimeout(() => {
+                if (isSpeakingRef.current && isSessionActiveRef.current) {
+                  setAiResponse(lineText);
+                }
+              }, elapsedMs);
+              subtitleTimersRef.current.push(timerId);
+            }
+            elapsedMs += lineDuration;
+          }
         }
-        activeAudioSourceRef.current = null;
-        resumeListeningAfterAiSpeech();
-      };
 
-      source.start(0);
-    } catch (err) {
-      console.error('Audio decoding error:', err);
+        const ttsData = new Uint8Array(ttsAnalyser.frequencyBinCount);
+        if (ttsPulseIntervalRef.current) clearInterval(ttsPulseIntervalRef.current);
+        ttsPulseIntervalRef.current = setInterval(() => {
+          if (!isSpeakingRef.current || !isSessionActiveRef.current) {
+            clearInterval(ttsPulseIntervalRef.current);
+            ttsPulseIntervalRef.current = null;
+            return;
+          }
+          ttsAnalyser.getByteFrequencyData(ttsData);
+          let s = 0;
+          for (let i = 0; i < ttsData.length; i++) s += ttsData[i];
+          setAudioLevel(Math.min((s / ttsData.length) / 100, 1));
+        }, 50);
+
+        source.onended = () => {
+          if (ttsPulseIntervalRef.current) {
+            clearInterval(ttsPulseIntervalRef.current);
+            ttsPulseIntervalRef.current = null;
+          }
+          activeAudioSourceRef.current = null;
+          resolve();
+        };
+
+        source.start(0);
+      } catch (err) {
+        console.error('Audio decoding error:', err);
+        resolve();
+      }
+    });
+  }, []);
+
+  // Play audio array buffer via Web Audio API at 1.1x speed
+  const playAudioBuffer = useCallback(async (arrayBuffer, textForSubtitles = '') => {
+    await playSingleBufferWithSubtitles(arrayBuffer, textForSubtitles);
+    if (isSessionActiveRef.current && isSpeakingRef.current) {
       resumeListeningAfterAiSpeech();
     }
-  }, [resumeListeningAfterAiSpeech]);
+  }, [playSingleBufferWithSubtitles, resumeListeningAfterAiSpeech]);
 
   // Immediate mid-sentence interruption (Barge-In): stops AI voice immediately & listens to what user is saying!
   const interruptAiSpeech = useCallback((preserveCurrentSpeech = false) => {
@@ -508,7 +576,8 @@ export function useVoiceInterview() {
     aiSpeechStartTimeRef.current = Date.now();
     currentAiTextRef.current = text.toLowerCase();
     setStatus('speaking');
-    setAiResponse(text);
+    const initialLines = splitIntoMovieLines(text);
+    setAiResponse(initialLines[0] || text);
 
     // 0. Default Built-In Ultra-Fast Neural Voice (en-US-JennyNeural via /api/tts at 1.1x playback rate)
     if (voiceProvider === 'neural' || voiceProvider === 'browser') {
@@ -536,70 +605,23 @@ export function useVoiceInterview() {
         if (sentences.length <= 1) {
           const buffer = await fetchSentenceAudio(text);
           if (buffer && isSessionActiveRef.current && isSpeakingRef.current) {
-            await playAudioBuffer(buffer);
+            await playAudioBuffer(buffer, text);
             return;
           }
         } else {
-          const firstChunkText = sentences[0];
-          const restChunkText = sentences.slice(1).join(' ');
-
-          const firstPromise = fetchSentenceAudio(firstChunkText);
-          const restPromise = fetchSentenceAudio(restChunkText);
-
-          const firstBuffer = await firstPromise;
-          if (firstBuffer && isSessionActiveRef.current && isSpeakingRef.current) {
-            await new Promise((resolve) => {
-              const playFirst = async () => {
-                if (!isSessionActiveRef.current || !isSpeakingRef.current || !audioContextRef.current) return resolve();
-                const ctx = audioContextRef.current;
-                if (ctx.state === 'suspended') await ctx.resume();
-                try {
-                  const audioBuffer = await ctx.decodeAudioData(firstBuffer);
-                  if (!isSessionActiveRef.current || !isSpeakingRef.current) return resolve();
-                  const source = ctx.createBufferSource();
-                  source.buffer = audioBuffer;
-                  source.playbackRate.value = VOICE_PLAYBACK_RATE; // 1.1x faster!
-                  const ttsAnalyser = ctx.createAnalyser();
-                  ttsAnalyser.fftSize = 256;
-                  source.connect(ttsAnalyser);
-                  ttsAnalyser.connect(ctx.destination);
-                  activeAudioSourceRef.current = source;
-                  isSpeakingRef.current = true;
-                  setStatus('speaking');
-
-                  const ttsData = new Uint8Array(ttsAnalyser.frequencyBinCount);
-                  if (ttsPulseIntervalRef.current) clearInterval(ttsPulseIntervalRef.current);
-                  ttsPulseIntervalRef.current = setInterval(() => {
-                    if (!isSpeakingRef.current || !isSessionActiveRef.current) {
-                      clearInterval(ttsPulseIntervalRef.current);
-                      ttsPulseIntervalRef.current = null;
-                      return;
-                    }
-                    ttsAnalyser.getByteFrequencyData(ttsData);
-                    let s = 0;
-                    for (let i = 0; i < ttsData.length; i++) s += ttsData[i];
-                    setAudioLevel(Math.min((s / ttsData.length) / 100, 1));
-                  }, 50);
-
-                  source.onended = () => resolve();
-                  source.start(0);
-                } catch (_) {
-                  resolve();
-                }
-              };
-              playFirst();
-            });
-
+          // Prefetch all sentences in parallel so each sentence plays seamlessly with line-by-line movie subtitles!
+          const audioPromises = sentences.map(s => fetchSentenceAudio(s));
+          for (let i = 0; i < sentences.length; i++) {
             if (!isSessionActiveRef.current || !isSpeakingRef.current) return;
-            const restBuffer = await restPromise;
-            if (restBuffer && isSessionActiveRef.current && isSpeakingRef.current) {
-              await playAudioBuffer(restBuffer);
-              return;
-            } else {
-              resumeListeningAfterAiSpeech();
-              return;
+            const sentenceBuffer = await audioPromises[i];
+            if (sentenceBuffer && isSessionActiveRef.current && isSpeakingRef.current) {
+              await playSingleBufferWithSubtitles(sentenceBuffer, sentences[i]);
             }
           }
+          if (isSessionActiveRef.current && isSpeakingRef.current) {
+            resumeListeningAfterAiSpeech();
+          }
+          return;
         }
       } catch (err) {
         if (err.name === 'AbortError' || !isSessionActiveRef.current) return;
@@ -633,7 +655,7 @@ export function useVoiceInterview() {
         if (response.ok && isSessionActiveRef.current && isSpeakingRef.current) {
           const buffer = await response.arrayBuffer();
           if (isSessionActiveRef.current && isSpeakingRef.current) {
-            await playAudioBuffer(buffer);
+            await playAudioBuffer(buffer, text);
           }
           return;
         }
@@ -662,7 +684,7 @@ export function useVoiceInterview() {
         if (response.ok && isSessionActiveRef.current && isSpeakingRef.current) {
           const buffer = await response.arrayBuffer();
           if (isSessionActiveRef.current && isSpeakingRef.current) {
-            await playAudioBuffer(buffer);
+            await playAudioBuffer(buffer, text);
           }
           return;
         }
@@ -690,7 +712,7 @@ export function useVoiceInterview() {
         if (response.ok && isSessionActiveRef.current && isSpeakingRef.current) {
           const buffer = await response.arrayBuffer();
           if (isSessionActiveRef.current && isSpeakingRef.current) {
-            await playAudioBuffer(buffer);
+            await playAudioBuffer(buffer, text);
           }
           return;
         }
@@ -701,7 +723,7 @@ export function useVoiceInterview() {
 
     if (!isSessionActiveRef.current || !isSpeakingRef.current) return;
 
-    // 4. Fallback: Browser Native Speech Synthesis
+    // 4. Fallback: Browser Native Speech Synthesis with word-boundary movie subtitle sync
     if (typeof window !== 'undefined' && window.speechSynthesis) {
       window.speechSynthesis.cancel();
 
@@ -715,6 +737,25 @@ export function useVoiceInterview() {
 
       utterance.rate = VOICE_PLAYBACK_RATE; // 1.1x slightly faster!
       utterance.pitch = 1.0;
+
+      // Sync movie subtitle lines using estimated timing or boundary events
+      const lines = splitIntoMovieLines(text);
+      const estTotalMs = Math.max(1500, (text.split(/\s+/).length / 2.8) * 1000);
+      const totalChars = lines.reduce((sum, l) => sum + l.length, 0) || 1;
+      let elapsedMs = 0;
+      for (let i = 0; i < lines.length; i++) {
+        const lineDur = (lines[i].length / totalChars) * estTotalMs;
+        if (i > 0) {
+          const lineStr = lines[i];
+          const tid = setTimeout(() => {
+            if (isSpeakingRef.current && isSessionActiveRef.current) {
+              setAiResponse(lineStr);
+            }
+          }, elapsedMs);
+          subtitleTimersRef.current.push(tid);
+        }
+        elapsedMs += lineDur;
+      }
 
       if (chromeKeepAliveTimerRef.current) clearInterval(chromeKeepAliveTimerRef.current);
       chromeKeepAliveTimerRef.current = setInterval(() => {
@@ -787,6 +828,7 @@ export function useVoiceInterview() {
     kokoroEndpoint,
     kokoroVoice,
     playAudioBuffer,
+    playSingleBufferWithSubtitles,
     resumeListeningAfterAiSpeech,
     selectedBrowserVoice,
     browserVoices

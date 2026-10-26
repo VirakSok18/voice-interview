@@ -1,9 +1,11 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import VoiceOrb from './components/VoiceOrb';
 import { useVoiceInterview } from './hooks/useVoiceInterview';
 
 export default function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [isTranscriptOpen, setIsTranscriptOpen] = useState(false);
+  const transcriptEndRef = useRef(null);
 
   const {
     customRoleTitle,
@@ -25,6 +27,13 @@ export default function App() {
 
   const isSessionActive = status !== 'idle';
 
+  // Auto-scroll the right transcript drawer whenever new messages arrive
+  useEffect(() => {
+    if (isTranscriptOpen && transcriptEndRef.current) {
+      transcriptEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [history, isTranscriptOpen]);
+
   // Tap directly on the voice bubble to start or stop/close voice
   const handleOrbClick = () => {
     if (!isSessionActive) {
@@ -37,19 +46,11 @@ export default function App() {
   // Current active subtitle text to display below the bubble
   const liveUserText = `${transcript} ${interimTranscript}`.trim();
 
-  // Dynamic font sizing so even long explanations always fit inside the display cleanly
-  const getDynamicSubtitleClass = (text) => {
-    const len = (text || '').length;
-    if (len > 340) {
-      return 'text-xs sm:text-sm leading-snug';
-    }
-    if (len > 220) {
-      return 'text-sm sm:text-base leading-normal';
-    }
-    if (len > 120) {
-      return 'text-base sm:text-lg leading-relaxed';
-    }
-    return 'text-lg sm:text-2xl leading-relaxed';
+  // For user's live speech, show only the latest ~9 words like a live movie caption line
+  const getLiveUserMovieLine = (text) => {
+    const words = text.trim().split(/\s+/).filter(Boolean);
+    if (words.length <= 10) return text;
+    return words.slice(-10).join(' ');
   };
 
   return (
@@ -63,9 +64,12 @@ export default function App() {
         }}
       />
 
-      {/* Minimal Top-Left Menu Trigger (Two clean lines) */}
+      {/* Minimal Top-Left Menu Trigger (Past Interviews Sidebar) */}
       <button
-        onClick={() => setIsSidebarOpen(true)}
+        onClick={() => {
+          setIsTranscriptOpen(false);
+          setIsSidebarOpen(true);
+        }}
         aria-label="Toggle history"
         className="fixed top-6 left-6 z-30 p-2 text-slate-400 hover:text-white transition-colors cursor-pointer"
       >
@@ -75,15 +79,32 @@ export default function App() {
         </div>
       </button>
 
-      {/* Backdrop with smooth fade */}
+      {/* Minimal Top-Right Trigger (Current Interview Back-and-Forth Transcript) */}
+      <button
+        onClick={() => {
+          setIsSidebarOpen(false);
+          setIsTranscriptOpen(true);
+        }}
+        aria-label="Open conversation transcript"
+        className="fixed top-6 right-6 z-30 px-3 py-1.5 rounded-lg text-xs font-medium text-slate-400 hover:text-white border border-white/10 hover:border-white/25 bg-white/[0.02] hover:bg-white/[0.06] transition-all cursor-pointer"
+      >
+        Transcript
+      </button>
+
+      {/* Shared Backdrop with smooth fade */}
       <div
-        onClick={() => setIsSidebarOpen(false)}
+        onClick={() => {
+          setIsSidebarOpen(false);
+          setIsTranscriptOpen(false);
+        }}
         className={`fixed inset-0 z-40 bg-black/50 backdrop-blur-xs transition-opacity duration-300 ease-out ${
-          isSidebarOpen ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'
+          isSidebarOpen || isTranscriptOpen
+            ? 'opacity-100 pointer-events-auto'
+            : 'opacity-0 pointer-events-none'
         }`}
       />
 
-      {/* Ultra-Clean Minimal Sidebar with Smooth Sliding Open & Close Animation */}
+      {/* Left Sidebar: Past Interviews History */}
       <aside
         className={`fixed top-0 left-0 z-50 w-64 sm:w-72 h-full bg-[#080a11]/95 backdrop-blur-2xl border-r border-white/[0.06] flex flex-col p-6 transition-transform duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
           isSidebarOpen ? 'translate-x-0' : '-translate-x-full'
@@ -139,10 +160,61 @@ export default function App() {
         </div>
       </aside>
 
+      {/* Right Drawer: Full Back-and-Forth Conversation Transcript */}
+      <aside
+        className={`fixed top-0 right-0 z-50 w-80 sm:w-96 h-full bg-[#080a11]/95 backdrop-blur-2xl border-l border-white/[0.06] flex flex-col p-6 transition-transform duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] select-text ${
+          isTranscriptOpen ? 'translate-x-0' : 'translate-x-full'
+        }`}
+      >
+        <div className="flex items-center justify-between pb-4 mb-4 border-b border-white/[0.08]">
+          <span className="text-sm font-medium text-slate-200">
+            {customRoleTitle || 'Conversation'}
+          </span>
+          <button
+            onClick={() => setIsTranscriptOpen(false)}
+            className="text-sm text-slate-400 hover:text-white px-2 py-0.5 cursor-pointer"
+          >
+            ×
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto space-y-4 pr-1">
+          {history.length === 0 ? (
+            <p className="text-xs text-slate-500 text-center mt-10">
+              No messages yet. Tap the bubble to start talking.
+            </p>
+          ) : (
+            history.map((item, idx) => {
+              const isAi = item.sender === 'ai';
+              return (
+                <div
+                  key={idx}
+                  className={`flex flex-col ${isAi ? 'items-start' : 'items-end'}`}
+                >
+                  <span className="text-[10px] uppercase tracking-wider text-slate-500 mb-1 px-1">
+                    {isAi ? 'Interviewer' : 'You'}
+                  </span>
+                  <div
+                    className={`max-w-[90%] rounded-2xl px-3.5 py-2.5 text-xs sm:text-sm leading-relaxed ${
+                      isAi
+                        ? 'bg-white/[0.06] text-slate-200 border border-white/[0.08]'
+                        : 'bg-indigo-500/20 text-indigo-100 border border-indigo-400/25'
+                    }`}
+                  >
+                    {item.text}
+                  </div>
+                </div>
+              );
+            })
+          )}
+          <div ref={transcriptEndRef} />
+        </div>
+      </aside>
+
       {/* Top Balance Spacer */}
       <div className="h-4 shrink-0" />
 
-      {/* Center Interactive 3D Voice Bubble (Scales responsively to leave plenty of room for subtitles) */}
+      {/* Center Interactive 3D Voice Bubble */}
       <div
         onClick={handleOrbClick}
         role="button"
@@ -156,8 +228,8 @@ export default function App() {
         <VoiceOrb status={status} audioLevel={audioLevel} />
       </div>
 
-      {/* Dynamic Auto-Scaling Subtitle Area Directly Below Bubble (Always fits inside viewport!) */}
-      <div className="relative z-20 w-full max-w-2xl h-[34dvh] max-h-[34dvh] flex flex-col items-center justify-center text-center px-3 overflow-y-auto">
+      {/* Movie-Style Line-by-Line Subtitle Display Directly Below Bubble */}
+      <div className="relative z-20 w-full max-w-2xl h-[24dvh] flex flex-col items-center justify-center text-center px-4 pointer-events-none">
         {!isSessionActive ? (
           <p className="text-base sm:text-xl text-slate-400 font-medium tracking-wide">
             {customRoleTitle && history.length > 0
@@ -169,12 +241,8 @@ export default function App() {
             {micWarning}
           </p>
         ) : liveUserText ? (
-          <p
-            className={`${getDynamicSubtitleClass(
-              liveUserText
-            )} text-emerald-300 font-semibold tracking-tight break-words drop-shadow-[0_2px_12px_rgba(0,0,0,0.9)] transition-all duration-150`}
-          >
-            {liveUserText}
+          <p className="text-lg sm:text-2xl text-emerald-300 font-semibold leading-relaxed tracking-tight drop-shadow-[0_2px_12px_rgba(0,0,0,0.95)] transition-all duration-150">
+            {getLiveUserMovieLine(liveUserText)}
           </p>
         ) : status === 'thinking' ? (
           <p className="text-lg sm:text-xl text-cyan-300/90 font-medium leading-relaxed animate-pulse">
@@ -182,9 +250,8 @@ export default function App() {
           </p>
         ) : aiResponse ? (
           <p
-            className={`${getDynamicSubtitleClass(
-              aiResponse
-            )} text-white font-semibold tracking-tight break-words drop-shadow-[0_2px_14px_rgba(0,0,0,0.95)] transition-all duration-150`}
+            key={aiResponse}
+            className="text-lg sm:text-2xl text-white font-semibold leading-relaxed tracking-tight drop-shadow-[0_2px_14px_rgba(0,0,0,0.95)] animate-in fade-in duration-150"
           >
             {aiResponse}
           </p>
