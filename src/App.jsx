@@ -89,13 +89,13 @@ export default function App() {
           isSidebarOpen ? 'translate-x-0' : '-translate-x-full'
         }`}
       >
-        {/* Top Action: Simple "New interview" */}
+        {/* Top Action: Outlined "New interview" Button */}
         <button
           onClick={() => {
             createNewInterviewSession();
             setIsSidebarOpen(false);
           }}
-          className="w-full text-left py-2.5 px-3 rounded-lg text-sm font-medium text-slate-200 hover:text-white hover:bg-white/[0.05] transition-colors cursor-pointer mb-4"
+          className="w-full text-center py-2.5 px-4 rounded-xl text-sm font-medium text-slate-100 border border-white/20 bg-white/[0.04] hover:bg-white/[0.1] hover:border-white/35 active:scale-[0.98] transition-all cursor-pointer mb-5"
         >
           + New interview
         </button>

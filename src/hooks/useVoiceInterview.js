@@ -1089,12 +1089,12 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
 
         const now = Date.now();
 
-        // Instant Voice Barge-In Detection while AI is speaking:
-        // If AI has been speaking for >450ms and user speaks into the mic above threshold, cut off AI immediately!
+        // Only detect Barge-In via sustained human speech on mobile (where WebSpeech isn't running)
+        // Requires 15+ consecutive frames (~260ms) of strong human voice (>0.24) so slight noises/taps never interrupt!
         if (isSpeakingRef.current) {
-          if (now - aiSpeechStartTimeRef.current > 450 && normalized > 0.14) {
+          if (isMobileDevice && now - aiSpeechStartTimeRef.current > 800 && normalized > 0.24) {
             bargeInFrames++;
-            if (bargeInFrames >= 3) {
+            if (bargeInFrames >= 15) {
               bargeInFrames = 0;
               interruptAiSpeech(true);
               lastVoiceTime = now;
@@ -1198,18 +1198,20 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
       const incomingSpeech = (newlyFinal + ' ' + interim).trim();
 
       // If AI is currently speaking and user starts talking:
+      // Only interrupt when Web Speech recognizes an actual spoken phrase (at least 2 real words or a clear spoken command >= 6 chars),
+      // so background noises, coughs, or single-syllable mic pops NEVER cut off the AI!
       if (isSpeakingRef.current) {
-        if (!incomingSpeech || incomingSpeech.length < 2) return;
+        const words = incomingSpeech.split(/\s+/).filter(w => w.length >= 2);
+        const isRealSpokenPhrase = words.length >= 2 || incomingSpeech.length >= 8;
+        if (!isRealSpokenPhrase) return;
 
-        // Ignore if mic only picked up a direct echo snippet of the AI's own sentence within first 600ms
+        // Ignore if mic picked up a snippet of the AI's own sentence
         const normIncoming = incomingSpeech.toLowerCase().trim();
-        const isEchoOfAi =
-          Date.now() - aiSpeechStartTimeRef.current < 600 &&
-          currentAiTextRef.current.includes(normIncoming);
+        const isEchoOfAi = currentAiTextRef.current.includes(normIncoming);
 
         if (isEchoOfAi) return;
 
-        // Genuine user interruption! Stop AI voice immediately and capture user's new speech!
+        // Genuine spoken phrase from user! Stop AI voice immediately and capture user's new speech!
         killAllVoiceOutput();
         setStatus('listening');
       }
