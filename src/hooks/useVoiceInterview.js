@@ -359,9 +359,9 @@ export function useVoiceInterview() {
     return null;
   }, [groqKey]);
 
-  // Transcribe recorded mobile/desktop audio blob using Groq Whisper (Fallback for mobile Chrome)
+  // Transcribe recorded audio blob using Groq Whisper (Works with a single persistent mic stream!)
   const transcribeAudioWithWhisper = useCallback(async (audioBlob) => {
-    if (!groqKey.trim() || !audioBlob || audioBlob.size < 2500 || !isSessionActiveRef.current) return '';
+    if (!groqKey.trim() || !audioBlob || audioBlob.size < 1600 || !isSessionActiveRef.current) return '';
     try {
       const formData = new FormData();
       const ext = audioBlob.type.includes('mp4') ? 'm4a' : 'webm';
@@ -382,8 +382,8 @@ export function useVoiceInterview() {
         const data = await res.json();
         const text = (data.text || '').trim();
         if (
-          text.length < 3 ||
-          /^(thank you\.?|thanks for watching\.?|you\.?|bye\.?|okay\.?|oh\.?|uh\.?|um\.?|hmm\.?|subtitles by.*|\.+)$/i.test(text)
+          text.length < 2 ||
+          /^(thank you\.?|thanks for watching\.?|you\.?|bye\.?|subtitles by.*|\.+)$/i.test(text)
         ) {
           return '';
         }
@@ -402,12 +402,15 @@ export function useVoiceInterview() {
     setAudioLevel(0);
     setStatus('listening');
 
-    if (recognitionRef.current) {
+    // Only call recognition.start() on desktop where continuous=true keeps a single session alive.
+    // On mobile (iOS/Android), calling recognition.start() triggers a brand-new OS microphone permission popup every time!
+    // Mobile instead uses the persistent getUserMedia stream + MediaRecorder + Groq Whisper so it NEVER re-prompts!
+    if (!isMobileDevice && recognitionRef.current) {
       try {
         recognitionRef.current.start();
       } catch (_) {}
     }
-  }, []);
+  }, [isMobileDevice]);
 
   // Play audio array buffer via Web Audio API at 1.1x speed (tiny bit faster!)
   const playAudioBuffer = useCallback(async (arrayBuffer) => {
@@ -477,12 +480,12 @@ export function useVoiceInterview() {
     }
 
     setStatus('listening');
-    if (recognitionRef.current) {
+    if (!isMobileDevice && recognitionRef.current) {
       try {
         recognitionRef.current.start();
       } catch (_) {}
     }
-  }, [clearSpeechBuffers, killAllVoiceOutput]);
+  }, [clearSpeechBuffers, isMobileDevice, killAllVoiceOutput]);
 
   // Main Speech Synthesis Dispatcher
   const speakText = useCallback(async (text) => {
@@ -1032,9 +1035,9 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
         source.connect(analyser);
       }
 
-      // MediaRecorder fallback ONLY for mobile devices where Web Speech API might fail
+      // MediaRecorder on the single persistent getUserMedia stream (used on mobile so SpeechRecognition never re-prompts!)
       let recorder = mediaRecorderRef.current;
-      if (isMobileDevice && !recorder && typeof window.MediaRecorder !== 'undefined') {
+      if (!recorder && typeof window.MediaRecorder !== 'undefined') {
         try {
           recorder = new MediaRecorder(stream);
           mediaRecorderRef.current = recorder;
@@ -1094,6 +1097,14 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
             if (bargeInFrames >= 3) {
               bargeInFrames = 0;
               interruptAiSpeech(true);
+              lastVoiceTime = now;
+              if (recorder && recorder.state === 'inactive' && !isRecordingChunkRef.current) {
+                audioChunksRef.current = [];
+                isRecordingChunkRef.current = true;
+                try {
+                  recorder.start();
+                } catch (_) {}
+              }
             }
           } else {
             bargeInFrames = Math.max(0, bargeInFrames - 1);
@@ -1101,7 +1112,7 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
         } else {
           setAudioLevel(normalized);
 
-          if (normalized > 0.08) {
+          if (normalized > 0.055) {
             lastVoiceTime = now;
 
             if (
@@ -1144,20 +1155,27 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
     }
   }, [interruptAiSpeech, isMobileDevice, submitCandidateAnswer, transcribeAudioWithWhisper]);
 
-  // Speech Recognition (Web Speech API) - Supports instant Barge-In Interruption when user talks over AI!
+  // Speech Recognition (Web Speech API) - Desktop only!
+  // On Mobile (iOS/Android), webkitSpeechRecognition.start() triggers a recurring microphone permission popup every time.
+  // So mobile uses our persistent getUserMedia stream + MediaRecorder + Whisper, which NEVER re-prompts!
   const initializeSpeechRecognition = useCallback(() => {
+    if (isMobileDevice) return;
+
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) return;
 
+    // Reuse existing recognition instance if already running so we never re-trigger permission prompts
     if (recognitionRef.current) {
       try {
-        recognitionRef.current.onend = null;
-        recognitionRef.current.abort();
-      } catch (_) {}
+        recognitionRef.current.start();
+        return;
+      } catch (_) {
+        return;
+      }
     }
 
     const recognition = new SpeechRecognition();
-    recognition.continuous = !isMobileDevice;
+    recognition.continuous = true;
     recognition.interimResults = true;
     recognition.lang = 'en-US';
 
@@ -1329,7 +1347,7 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
     audioChunksRef.current = [];
     isRecordingChunkRef.current = false;
 
-    if (recognitionRef.current) {
+    if (destroyHardwareTracks === true && recognitionRef.current) {
       try {
         recognitionRef.current.onresult = null;
         recognitionRef.current.onend = null;
@@ -1340,17 +1358,12 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
       recognitionRef.current = null;
     }
 
-    if (micStreamRef.current) {
+    // Keep mic tracks alive across taps so browser NEVER re-prompts for permission!
+    if (destroyHardwareTracks === true && micStreamRef.current) {
       try {
-        if (destroyHardwareTracks === true) {
-          micStreamRef.current.getTracks().forEach(track => track.stop());
-          micStreamRef.current = null;
-        } else {
-          micStreamRef.current.getAudioTracks().forEach(track => {
-            track.enabled = false;
-          });
-        }
+        micStreamRef.current.getTracks().forEach(track => track.stop());
       } catch (_) {}
+      micStreamRef.current = null;
     }
 
     if (destroyHardwareTracks === true && audioContextRef.current && audioContextRef.current.state !== 'closed') {
@@ -1359,10 +1372,6 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
       } catch (_) {}
       audioContextRef.current = null;
       analyserRef.current = null;
-    } else if (audioContextRef.current && audioContextRef.current.state === 'running') {
-      try {
-        audioContextRef.current.suspend();
-      } catch (_) {}
     }
 
     if (rafIdRef.current) {

@@ -1,7 +1,6 @@
 import React, { useState } from 'react';
 import VoiceOrb from './components/VoiceOrb';
 import { useVoiceInterview } from './hooks/useVoiceInterview';
-import { PanelLeft, Plus, MessageSquare, Trash2, X } from 'lucide-react';
 
 export default function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
@@ -38,13 +37,6 @@ export default function App() {
   // Current active subtitle text to display below the bubble
   const liveUserText = `${transcript} ${interimTranscript}`.trim();
 
-  // Format relative time for sidebar items
-  const formatSessionMeta = (session) => {
-    const count = Array.isArray(session.history) ? session.history.length : 0;
-    if (count === 0) return 'Not started yet';
-    return `${Math.ceil(count / 2)} Q&A turns`;
-  };
-
   return (
     <main className="relative w-screen h-[100dvh] overflow-hidden bg-[#06080f] text-slate-100 flex flex-col items-center justify-center px-6 select-none">
       {/* Subtle Ambient Glow */}
@@ -56,108 +48,81 @@ export default function App() {
         }}
       />
 
-      {/* Minimal Floating Sidebar Toggle Button (Top-Left) */}
+      {/* Minimal Top-Left Menu Trigger (Two clean lines) */}
       <button
         onClick={() => setIsSidebarOpen(true)}
-        aria-label="Open interview history sidebar"
-        title="Interview History"
-        className="fixed top-5 left-5 z-30 w-10 h-10 rounded-xl bg-white/5 hover:bg-white/10 border border-white/10 flex items-center justify-center text-slate-300 hover:text-white transition-all active:scale-95 cursor-pointer backdrop-blur-md"
+        aria-label="Toggle history"
+        className="fixed top-6 left-6 z-30 p-2 text-slate-400 hover:text-white transition-colors cursor-pointer"
       >
-        <PanelLeft size={19} />
+        <div className="w-5 flex flex-col gap-1.5">
+          <span className="w-5 h-[1.5px] bg-current rounded-full" />
+          <span className="w-3.5 h-[1.5px] bg-current rounded-full" />
+        </div>
       </button>
 
-      {/* ChatGPT-Style Interview History Sidebar Drawer */}
-      {isSidebarOpen && (
-        <div className="fixed inset-0 z-50 flex">
-          {/* Backdrop */}
-          <div
-            onClick={() => setIsSidebarOpen(false)}
-            className="fixed inset-0 bg-black/60 backdrop-blur-xs transition-opacity"
-          />
+      {/* Backdrop with smooth fade */}
+      <div
+        onClick={() => setIsSidebarOpen(false)}
+        className={`fixed inset-0 z-40 bg-black/50 backdrop-blur-xs transition-opacity duration-300 ease-out ${
+          isSidebarOpen ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'
+        }`}
+      />
 
-          {/* Sidebar Panel */}
-          <aside className="relative z-10 w-72 sm:w-80 h-full bg-[#0b0e17]/95 backdrop-blur-2xl border-r border-white/10 flex flex-col justify-between p-4 shadow-2xl">
-            {/* Top Bar: New Interview + Close */}
-            <div className="space-y-3">
-              <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold uppercase tracking-wider text-slate-400 px-1">
-                  Interview History
-                </span>
-                <button
-                  onClick={() => setIsSidebarOpen(false)}
-                  className="w-8 h-8 rounded-lg hover:bg-white/10 flex items-center justify-center text-slate-400 hover:text-white transition-colors cursor-pointer"
-                  aria-label="Close sidebar"
-                >
-                  <X size={17} />
-                </button>
-              </div>
+      {/* Ultra-Clean Minimal Sidebar with Smooth Sliding Open & Close Animation */}
+      <aside
+        className={`fixed top-0 left-0 z-50 w-64 sm:w-72 h-full bg-[#080a11]/95 backdrop-blur-2xl border-r border-white/[0.06] flex flex-col p-6 transition-transform duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+          isSidebarOpen ? 'translate-x-0' : '-translate-x-full'
+        }`}
+      >
+        {/* Top Action: Simple "New interview" */}
+        <button
+          onClick={() => {
+            createNewInterviewSession();
+            setIsSidebarOpen(false);
+          }}
+          className="w-full text-left py-2.5 px-3 rounded-lg text-sm font-medium text-slate-200 hover:text-white hover:bg-white/[0.05] transition-colors cursor-pointer mb-4"
+        >
+          + New interview
+        </button>
 
-              <button
+        {/* Clean List of Past Interviews (No icons, no extra subtitle text, no bright colors) */}
+        <div className="flex-1 overflow-y-auto space-y-1">
+          {sessions.map((session) => {
+            const isSelected = session.id === activeSessionId;
+            return (
+              <div
+                key={session.id}
                 onClick={() => {
-                  createNewInterviewSession();
+                  selectInterviewSession(session.id);
                   setIsSidebarOpen(false);
                 }}
-                className="w-full py-2.5 px-3.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 active:scale-[0.99] text-white text-sm font-semibold flex items-center gap-2.5 shadow-lg shadow-indigo-600/20 transition-all cursor-pointer"
+                className={`group flex items-center justify-between px-3 py-2 rounded-lg text-sm cursor-pointer transition-colors ${
+                  isSelected
+                    ? 'bg-white/[0.08] text-white font-medium'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-white/[0.04]'
+                }`}
               >
-                <Plus size={17} />
-                <span>New Interview</span>
-              </button>
-            </div>
+                <span className="truncate pr-2">
+                  {session.title || 'New Interview'}
+                </span>
 
-            {/* Saved Sessions List */}
-            <div className="flex-1 overflow-y-auto my-4 space-y-1.5 pr-1">
-              {sessions.map((session) => {
-                const isSelected = session.id === activeSessionId;
-                return (
-                  <div
-                    key={session.id}
-                    onClick={() => {
-                      selectInterviewSession(session.id);
-                      setIsSidebarOpen(false);
+                {sessions.length > 1 && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      deleteInterviewSession(session.id);
                     }}
-                    className={`group flex items-center justify-between px-3 py-2.5 rounded-xl cursor-pointer transition-all border ${
-                      isSelected
-                        ? 'bg-white/12 border-white/15 text-white'
-                        : 'bg-transparent border-transparent hover:bg-white/6 text-slate-300'
-                    }`}
+                    aria-label="Remove"
+                    className="opacity-60 sm:opacity-0 group-hover:opacity-100 text-xs text-slate-500 hover:text-slate-200 px-1.5 py-0.5 transition-opacity cursor-pointer shrink-0"
                   >
-                    <div className="flex items-center gap-2.5 min-w-0 flex-1">
-                      <MessageSquare
-                        size={15}
-                        className={isSelected ? 'text-indigo-400 shrink-0' : 'text-slate-500 shrink-0'}
-                      />
-                      <div className="min-w-0 flex-1">
-                        <p className="text-sm font-medium truncate">
-                          {session.title || 'New Interview'}
-                        </p>
-                        <p className="text-[11px] text-slate-400 truncate">
-                          {formatSessionMeta(session)}
-                        </p>
-                      </div>
-                    </div>
-
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        deleteInterviewSession(session.id);
-                      }}
-                      title="Delete interview"
-                      className="opacity-70 sm:opacity-0 group-hover:opacity-100 p-1.5 rounded-lg hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 transition-all cursor-pointer shrink-0"
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-
-            {/* Bottom Browser Memory Note */}
-            <div className="pt-3 border-t border-white/10 text-[11px] text-slate-400 flex items-center justify-between px-1">
-              <span>Saved automatically in this browser</span>
-            </div>
-          </aside>
+                    ×
+                  </button>
+                )}
+              </div>
+            );
+          })}
         </div>
-      )}
+      </aside>
 
       {/* Center Interactive 3D Voice Bubble (Tap to Start / Tap to Close Voice) */}
       <div
