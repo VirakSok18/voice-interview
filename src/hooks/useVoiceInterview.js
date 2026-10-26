@@ -9,7 +9,7 @@ import {
 } from '../services/interviewKnowledge';
 import { ELEVENLABS_VOICES } from '../services/voiceProviders';
 
-const SILENCE_SUBMIT_MS = 4000; // Wait 4 full seconds after user stops talking before submitting
+const SILENCE_SUBMIT_MS = 2500; // Wait 2.5 seconds after user stops talking before submitting
 const POST_SPEECH_COOLDOWN_MS = 900; // Ignore room echo for 0.9s right after AI finishes speaking
 
 export function useVoiceInterview() {
