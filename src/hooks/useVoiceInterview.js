@@ -392,16 +392,17 @@ export function useVoiceInterview() {
     return null;
   }, [groqKey]);
 
-  // Transcribe recorded audio blob using Groq Whisper (Works with a single persistent mic stream!)
+  // Transcribe recorded audio blob using Groq Whisper with strict hallucination & noise rejection!
   const transcribeAudioWithWhisper = useCallback(async (audioBlob) => {
-    if (!groqKey.trim() || !audioBlob || audioBlob.size < 1600 || !isSessionActiveRef.current) return '';
+    if (!groqKey.trim() || !audioBlob || audioBlob.size < 4500 || !isSessionActiveRef.current) return '';
     try {
       const formData = new FormData();
       const ext = audioBlob.type.includes('mp4') ? 'm4a' : 'webm';
       formData.append('file', audioBlob, `speech.${ext}`);
       formData.append('model', 'whisper-large-v3-turbo');
       formData.append('language', 'en');
-      formData.append('response_format', 'json');
+      formData.append('temperature', '0');
+      formData.append('response_format', 'verbose_json');
 
       const res = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
         method: 'POST',
@@ -414,10 +415,23 @@ export function useVoiceInterview() {
       if (res.ok) {
         const data = await res.json();
         const text = (data.text || '').trim();
-        if (
-          text.length < 2 ||
-          /^(thank you\.?|thanks for watching\.?|you\.?|bye\.?|subtitles by.*|\.+)$/i.test(text)
-        ) {
+
+        // Check Whisper's built-in no_speech_prob and avg_logprob on segments so background noise is 100% rejected!
+        if (Array.isArray(data.segments) && data.segments.length > 0) {
+          const avgNoSpeech =
+            data.segments.reduce((acc, s) => acc + (s.no_speech_prob || 0), 0) / data.segments.length;
+          const avgLogProb =
+            data.segments.reduce((acc, s) => acc + (s.avg_logprob || 0), 0) / data.segments.length;
+          if (avgNoSpeech > 0.45 || avgLogProb < -0.85) {
+            return '';
+          }
+        }
+
+        // Filter out common Whisper silence/background noise hallucinations
+        const hallucinationRegex =
+          /^(thank\s*you\.?|thanks\s*for\s*watching\.?|please\s*subscribe\.?|like\s*and\s*subscribe\.?|you\.?|bye\.?|okay\.?|oh\.?|uh\.?|um\.?|hmm\.?|ah\.?|huh\.?|yeah\.?|yes\.?|no\.?|so\.?|well\.?|the\.?|i\.?|and\.?|subtitles\s*by.*|translated\s*by.*|amara\.org.*|www\..*|\W+)$/i;
+
+        if (text.length < 3 || hallucinationRegex.test(text)) {
           return '';
         }
         return text;
@@ -1094,9 +1108,10 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
         source.connect(analyser);
       }
 
-      // MediaRecorder on the single persistent getUserMedia stream (used on mobile so SpeechRecognition never re-prompts!)
+      // MediaRecorder fallback ONLY on mobile devices (where WebSpeech isn't used)
       let recorder = mediaRecorderRef.current;
-      if (!recorder && typeof window.MediaRecorder !== 'undefined') {
+      let activeVoiceFramesCount = 0;
+      if (isMobileDevice && !recorder && typeof window.MediaRecorder !== 'undefined') {
         try {
           recorder = new MediaRecorder(stream);
           mediaRecorderRef.current = recorder;
@@ -1106,13 +1121,15 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
             }
           };
           recorder.onstop = async () => {
+            const spokenFrames = activeVoiceFramesCount;
+            activeVoiceFramesCount = 0;
             isRecordingChunkRef.current = false;
             const chunks = audioChunksRef.current;
             audioChunksRef.current = [];
             if (!isSessionActiveRef.current || isProcessingTurnRef.current || isSpeakingRef.current) return;
 
-            const existingWebSpeech = (transcriptAccumulatorRef.current + ' ' + currentInterimRef.current).trim();
-            if (existingWebSpeech.length > 1) return;
+            // Require at least ~350ms (20 frames) of actual sustained human voice so brief clicks/taps/noises are ignored!
+            if (spokenFrames < 20) return;
 
             if (chunks.length > 0) {
               const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
@@ -1132,6 +1149,7 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
       let lastVoiceTime = 0;
       let bargeInFrames = 0;
+      let startSpeechFrames = 0;
 
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
 
@@ -1149,16 +1167,17 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
         const now = Date.now();
 
         // Only detect Barge-In via sustained human speech on mobile (where WebSpeech isn't running)
-        // Requires 15+ consecutive frames (~260ms) of strong human voice (>0.24) so slight noises/taps never interrupt!
+        // Requires 18+ consecutive frames (~300ms) of strong human voice (>0.25) so slight noises/taps never interrupt!
         if (isSpeakingRef.current) {
-          if (isMobileDevice && now - aiSpeechStartTimeRef.current > 800 && normalized > 0.24) {
+          if (isMobileDevice && now - aiSpeechStartTimeRef.current > 800 && normalized > 0.25) {
             bargeInFrames++;
-            if (bargeInFrames >= 15) {
+            if (bargeInFrames >= 18) {
               bargeInFrames = 0;
               interruptAiSpeech(true);
               lastVoiceTime = now;
               if (recorder && recorder.state === 'inactive' && !isRecordingChunkRef.current) {
                 audioChunksRef.current = [];
+                activeVoiceFramesCount = 10;
                 isRecordingChunkRef.current = true;
                 try {
                   recorder.start();
@@ -1171,30 +1190,40 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
         } else {
           setAudioLevel(normalized);
 
-          if (normalized > 0.055) {
+          // Require genuine voice level (>0.14) for at least 6 frames (~100ms) before starting mobile recorder
+          if (normalized > 0.14) {
             lastVoiceTime = now;
+            startSpeechFrames++;
+            if (isRecordingChunkRef.current) {
+              activeVoiceFramesCount++;
+            }
 
             if (
+              startSpeechFrames >= 6 &&
               recorder &&
               recorder.state === 'inactive' &&
               !isRecordingChunkRef.current &&
               !isProcessingTurnRef.current
             ) {
               audioChunksRef.current = [];
+              activeVoiceFramesCount = startSpeechFrames;
               isRecordingChunkRef.current = true;
               try {
                 recorder.start();
               } catch (_) {}
             }
-          } else if (
-            isRecordingChunkRef.current &&
-            recorder &&
-            recorder.state === 'recording' &&
-            now - lastVoiceTime > SILENCE_SUBMIT_MS
-          ) {
-            try {
-              recorder.stop();
-            } catch (_) {}
+          } else {
+            startSpeechFrames = Math.max(0, startSpeechFrames - 1);
+            if (
+              isRecordingChunkRef.current &&
+              recorder &&
+              recorder.state === 'recording' &&
+              now - lastVoiceTime > SILENCE_SUBMIT_MS
+            ) {
+              try {
+                recorder.stop();
+              } catch (_) {}
+            }
           }
         }
 
@@ -1247,10 +1276,15 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
       let newlyFinal = '';
 
       for (let i = event.resultIndex; i < event.results.length; ++i) {
+        const alt = event.results[i][0];
         if (event.results[i].isFinal) {
-          newlyFinal += event.results[i][0].transcript + ' ';
+          // Ignore low-confidence background noise guesses from Chrome WebSpeech
+          if (typeof alt.confidence === 'number' && alt.confidence > 0 && alt.confidence < 0.45) {
+            continue;
+          }
+          newlyFinal += alt.transcript + ' ';
         } else {
-          interim += event.results[i][0].transcript;
+          interim += alt.transcript;
         }
       }
 
