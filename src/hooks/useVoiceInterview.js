@@ -10,56 +10,78 @@ import {
 import { ELEVENLABS_VOICES } from '../services/voiceProviders';
 
 const SILENCE_SUBMIT_MS = 1600; // 1.6s silence detection after speech ends
-const POST_SPEECH_COOLDOWN_MS = 650; // Ignore room echo for 0.65s right after AI finishes speaking
-const MEMORY_STORAGE_KEY = 'voice_interview_browser_memory_v1';
+const SESSIONS_STORAGE_KEY = 'voice_interview_sessions_v2';
+const ACTIVE_SESSION_COOKIE = 'voice_interview_active_id_v2';
+const VOICE_PLAYBACK_RATE = 1.1; // Tiny bit faster (1.1x) for natural, brisk interviewer cadence
 
-// Helper to read/write persistent browser memory via both localStorage and Cookies (365 days)
-function loadBrowserMemory() {
+function loadSavedSessions() {
   try {
-    const localRaw = localStorage.getItem(MEMORY_STORAGE_KEY);
-    if (localRaw) {
-      return JSON.parse(localRaw);
-    }
-    const cookieMatch = document.cookie
-      .split('; ')
-      .find(row => row.startsWith(`${MEMORY_STORAGE_KEY}=`));
-    if (cookieMatch) {
-      return JSON.parse(decodeURIComponent(cookieMatch.split('=')[1]));
+    const raw = localStorage.getItem(SESSIONS_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
     }
   } catch (_) {}
-  return null;
+  return [];
 }
 
-function saveBrowserMemory(memoryData) {
+function saveSessionsToBrowser(sessionsList, activeId) {
   try {
-    const serialized = JSON.stringify(memoryData);
-    localStorage.setItem(MEMORY_STORAGE_KEY, serialized);
-
-    // Also store a lightweight summary in a 1-year browser cookie so role & progress persist across sessions
-    const compactCookie = JSON.stringify({
-      role: memoryData.role,
-      customRoleTitle: memoryData.customRoleTitle,
-      interviewPhase: memoryData.interviewPhase,
-      questionIndex: memoryData.questionIndex,
-      updatedAt: memoryData.updatedAt
-    });
-    document.cookie = `${MEMORY_STORAGE_KEY}=${encodeURIComponent(compactCookie)}; path=/; max-age=31536000; SameSite=Lax`;
+    localStorage.setItem(SESSIONS_STORAGE_KEY, JSON.stringify(sessionsList.slice(0, 35)));
+    if (activeId) {
+      document.cookie = `${ACTIVE_SESSION_COOKIE}=${encodeURIComponent(activeId)}; path=/; max-age=31536000; SameSite=Lax`;
+    }
   } catch (_) {}
+}
+
+function getInitialActiveId(sessionsList) {
+  try {
+    const cookieMatch = document.cookie
+      .split('; ')
+      .find(row => row.startsWith(`${ACTIVE_SESSION_COOKIE}=`));
+    if (cookieMatch) {
+      const id = decodeURIComponent(cookieMatch.split('=')[1]);
+      if (sessionsList.some(s => s.id === id)) return id;
+    }
+  } catch (_) {}
+  return sessionsList[0]?.id || null;
+}
+
+function createBlankSession() {
+  return {
+    id: `session_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    title: 'New Interview',
+    role: 'undecided',
+    customRoleTitle: '',
+    interviewPhase: 'greeting',
+    questionIndex: -1,
+    history: [],
+    updatedAt: Date.now()
+  };
 }
 
 export function useVoiceInterview() {
-  const savedMem = useRef(loadBrowserMemory()).current;
+  const initialSessionsRef = useRef(null);
+  if (!initialSessionsRef.current) {
+    const loaded = loadSavedSessions();
+    initialSessionsRef.current = loaded.length > 0 ? loaded : [createBlankSession()];
+  }
 
-  const [role, setRole] = useState(savedMem?.role || 'undecided');
-  const [customRoleTitle, setCustomRoleTitle] = useState(savedMem?.customRoleTitle || '');
-  const [interviewPhase, setInterviewPhase] = useState(savedMem?.interviewPhase || 'greeting'); // 'greeting' | 'interviewing'
+  const [sessions, setSessions] = useState(initialSessionsRef.current);
+  const [activeSessionId, setActiveSessionId] = useState(() => getInitialActiveId(initialSessionsRef.current));
+
+  const currentSessionObj = sessions.find(s => s.id === activeSessionId) || sessions[0];
+
+  const [role, setRole] = useState(currentSessionObj.role || 'undecided');
+  const [customRoleTitle, setCustomRoleTitle] = useState(currentSessionObj.customRoleTitle || '');
+  const [interviewPhase, setInterviewPhase] = useState(currentSessionObj.interviewPhase || 'greeting');
   const [status, setStatus] = useState('idle'); // 'idle' | 'listening' | 'thinking' | 'speaking' | 'interrupted'
   const [audioLevel, setAudioLevel] = useState(0);
   const [transcript, setTranscript] = useState('');
   const [interimTranscript, setInterimTranscript] = useState('');
   const [aiResponse, setAiResponse] = useState('');
-  const [history, setHistory] = useState(Array.isArray(savedMem?.history) ? savedMem.history : []);
-  const [questionIndex, setQuestionIndex] = useState(typeof savedMem?.questionIndex === 'number' ? savedMem.questionIndex : -1);
+  const [history, setHistory] = useState(Array.isArray(currentSessionObj.history) ? currentSessionObj.history : []);
+  const [questionIndex, setQuestionIndex] = useState(typeof currentSessionObj.questionIndex === 'number' ? currentSessionObj.questionIndex : -1);
   const [isSpeechRecognitionSupported, setIsSpeechRecognitionSupported] = useState(true);
   const [silenceProgress, setSilenceProgress] = useState(0);
   const [micWarning, setMicWarning] = useState('');
@@ -95,9 +117,10 @@ export function useVoiceInterview() {
   const chromeKeepAliveTimerRef = useRef(null);
   const ttsFallbackTimeoutRef = useRef(null);
   const abortControllerRef = useRef(null);
-  const ignoreMicUntilRef = useRef(0);
 
   const isSpeakingRef = useRef(false);
+  const aiSpeechStartTimeRef = useRef(0);
+  const currentAiTextRef = useRef('');
   const rafIdRef = useRef(null);
   const transcriptAccumulatorRef = useRef('');
   const currentInterimRef = useRef('');
@@ -118,17 +141,31 @@ export function useVoiceInterview() {
   useEffect(() => { questionIndexRef.current = questionIndex; }, [questionIndex]);
   useEffect(() => { historyRef.current = history; }, [history]);
 
-  // Automatically persist interview state, role, and conversation history to browser storage + cookies
+  // Automatically sync current session changes into the sessions list & save to browser localStorage + cookies
   useEffect(() => {
-    saveBrowserMemory({
-      role,
-      customRoleTitle,
-      interviewPhase,
-      questionIndex,
-      history: history.slice(-16), // Keep last 16 turns in browser memory
-      updatedAt: Date.now()
+    setSessions(prev => {
+      const updated = prev.map(s => {
+        if (s.id !== activeSessionId) return s;
+        const derivedTitle =
+          customRoleTitle ||
+          (role !== 'undecided' ? PRESET_ROLES.find(r => r.id === role)?.name : '') ||
+          s.title ||
+          'New Interview';
+        return {
+          ...s,
+          title: derivedTitle,
+          role,
+          customRoleTitle,
+          interviewPhase,
+          questionIndex,
+          history: history.slice(-24),
+          updatedAt: history.length !== s.history?.length ? Date.now() : s.updatedAt
+        };
+      });
+      saveSessionsToBrowser(updated, activeSessionId);
+      return updated;
     });
-  }, [role, customRoleTitle, interviewPhase, questionIndex, history]);
+  }, [activeSessionId, role, customRoleTitle, interviewPhase, questionIndex, history]);
 
   // Check SpeechRecognition browser support
   useEffect(() => {
@@ -279,7 +316,7 @@ export function useVoiceInterview() {
     setAudioLevel(0);
   }, []);
 
-  // Helper to call Groq LLM with fast low-latency model and generous token budget so it never cuts off mid-sentence
+  // Helper to call Groq LLM with fast low-latency model and generous token budget
   const fetchGroqResponse = useCallback(async (messages) => {
     if (!groqKey.trim() || !isSessionActiveRef.current) return null;
 
@@ -358,33 +395,21 @@ export function useVoiceInterview() {
     return '';
   }, [groqKey]);
 
-  // Resume listening cleanly after AI finishes speaking (with cooldown to ignore room echo)
+  // Resume listening cleanly after AI finishes speaking
   const resumeListeningAfterAiSpeech = useCallback(() => {
     if (!isSessionActiveRef.current) return;
     isSpeakingRef.current = false;
     setAudioLevel(0);
-    clearSpeechBuffers();
-
-    // Unmute hardware microphone track now that AI finished speaking
-    if (micStreamRef.current) {
-      micStreamRef.current.getAudioTracks().forEach(t => { t.enabled = true; });
-    }
-
-    ignoreMicUntilRef.current = Date.now() + POST_SPEECH_COOLDOWN_MS;
     setStatus('listening');
 
-    setTimeout(() => {
-      if (!isSessionActiveRef.current || isSpeakingRef.current) return;
-      clearSpeechBuffers();
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.start();
-        } catch (_) {}
-      }
-    }, 300);
-  }, [clearSpeechBuffers]);
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.start();
+      } catch (_) {}
+    }
+  }, []);
 
-  // Play audio array buffer via Web Audio API
+  // Play audio array buffer via Web Audio API at 1.1x speed (tiny bit faster!)
   const playAudioBuffer = useCallback(async (arrayBuffer) => {
     if (!isSessionActiveRef.current || !audioContextRef.current) {
       resumeListeningAfterAiSpeech();
@@ -401,6 +426,7 @@ export function useVoiceInterview() {
 
       const source = ctx.createBufferSource();
       source.buffer = audioBuffer;
+      source.playbackRate.value = VOICE_PLAYBACK_RATE; // 1.1x slightly faster!
 
       const ttsAnalyser = ctx.createAnalyser();
       ttsAnalyser.fftSize = 256;
@@ -441,19 +467,22 @@ export function useVoiceInterview() {
     }
   }, [resumeListeningAfterAiSpeech]);
 
-  // Immediate mid-sentence interruption
-  const interruptAiSpeech = useCallback(() => {
+  // Immediate mid-sentence interruption (Barge-In): stops AI voice immediately & listens to what user is saying!
+  const interruptAiSpeech = useCallback((preserveCurrentSpeech = false) => {
     if (!isSessionActiveRef.current) return;
     killAllVoiceOutput();
-    clearSpeechBuffers();
-    setStatus('interrupted');
 
-    setTimeout(() => {
-      if (isSessionActiveRef.current) {
-        resumeListeningAfterAiSpeech();
-      }
-    }, 200);
-  }, [clearSpeechBuffers, killAllVoiceOutput, resumeListeningAfterAiSpeech]);
+    if (!preserveCurrentSpeech) {
+      clearSpeechBuffers();
+    }
+
+    setStatus('listening');
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.start();
+      } catch (_) {}
+    }
+  }, [clearSpeechBuffers, killAllVoiceOutput]);
 
   // Main Speech Synthesis Dispatcher
   const speakText = useCallback(async (text) => {
@@ -462,17 +491,10 @@ export function useVoiceInterview() {
     killAllVoiceOutput();
     clearSpeechBuffers();
 
-    // Pause SpeechRecognition & MediaRecorder while AI speaks so the mic NEVER transcribes the AI's own voice!
-    if (recognitionRef.current) {
+    // Ensure SpeechRecognition stays active on desktop so speaking immediately interrupts the AI!
+    if (!isMobileDevice && recognitionRef.current) {
       try {
-        recognitionRef.current.stop();
-      } catch (_) {}
-    }
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-      try {
-        audioChunksRef.current = [];
-        isRecordingChunkRef.current = false;
-        mediaRecorderRef.current.stop();
+        recognitionRef.current.start();
       } catch (_) {}
     }
 
@@ -480,11 +502,12 @@ export function useVoiceInterview() {
     abortControllerRef.current = controller;
 
     isSpeakingRef.current = true;
+    aiSpeechStartTimeRef.current = Date.now();
+    currentAiTextRef.current = text.toLowerCase();
     setStatus('speaking');
     setAiResponse(text);
 
-    // 0. Default Built-In Ultra-Fast Neural Voice (en-US-JennyNeural via /api/tts)
-    // Splits multi-sentence responses so Sentence 1 starts playing in ~0.35s while Sentence 2 prefetches in background!
+    // 0. Default Built-In Ultra-Fast Neural Voice (en-US-JennyNeural via /api/tts at 1.1x playback rate)
     if (voiceProvider === 'neural' || voiceProvider === 'browser') {
       try {
         const sentences = text
@@ -509,7 +532,7 @@ export function useVoiceInterview() {
 
         if (sentences.length <= 1) {
           const buffer = await fetchSentenceAudio(text);
-          if (buffer && isSessionActiveRef.current) {
+          if (buffer && isSessionActiveRef.current && isSpeakingRef.current) {
             await playAudioBuffer(buffer);
             return;
           }
@@ -521,17 +544,18 @@ export function useVoiceInterview() {
           const restPromise = fetchSentenceAudio(restChunkText);
 
           const firstBuffer = await firstPromise;
-          if (firstBuffer && isSessionActiveRef.current) {
+          if (firstBuffer && isSessionActiveRef.current && isSpeakingRef.current) {
             await new Promise((resolve) => {
               const playFirst = async () => {
-                if (!isSessionActiveRef.current || !audioContextRef.current) return resolve();
+                if (!isSessionActiveRef.current || !isSpeakingRef.current || !audioContextRef.current) return resolve();
                 const ctx = audioContextRef.current;
                 if (ctx.state === 'suspended') await ctx.resume();
                 try {
                   const audioBuffer = await ctx.decodeAudioData(firstBuffer);
-                  if (!isSessionActiveRef.current) return resolve();
+                  if (!isSessionActiveRef.current || !isSpeakingRef.current) return resolve();
                   const source = ctx.createBufferSource();
                   source.buffer = audioBuffer;
+                  source.playbackRate.value = VOICE_PLAYBACK_RATE; // 1.1x faster!
                   const ttsAnalyser = ctx.createAnalyser();
                   ttsAnalyser.fftSize = 256;
                   source.connect(ttsAnalyser);
@@ -563,9 +587,9 @@ export function useVoiceInterview() {
               playFirst();
             });
 
-            if (!isSessionActiveRef.current) return;
+            if (!isSessionActiveRef.current || !isSpeakingRef.current) return;
             const restBuffer = await restPromise;
-            if (restBuffer && isSessionActiveRef.current) {
+            if (restBuffer && isSessionActiveRef.current && isSpeakingRef.current) {
               await playAudioBuffer(restBuffer);
               return;
             } else {
@@ -603,9 +627,9 @@ export function useVoiceInterview() {
           })
         });
 
-        if (response.ok && isSessionActiveRef.current) {
+        if (response.ok && isSessionActiveRef.current && isSpeakingRef.current) {
           const buffer = await response.arrayBuffer();
-          if (isSessionActiveRef.current) {
+          if (isSessionActiveRef.current && isSpeakingRef.current) {
             await playAudioBuffer(buffer);
           }
           return;
@@ -632,9 +656,9 @@ export function useVoiceInterview() {
           })
         });
 
-        if (response.ok && isSessionActiveRef.current) {
+        if (response.ok && isSessionActiveRef.current && isSpeakingRef.current) {
           const buffer = await response.arrayBuffer();
-          if (isSessionActiveRef.current) {
+          if (isSessionActiveRef.current && isSpeakingRef.current) {
             await playAudioBuffer(buffer);
           }
           return;
@@ -660,9 +684,9 @@ export function useVoiceInterview() {
           })
         });
 
-        if (response.ok && isSessionActiveRef.current) {
+        if (response.ok && isSessionActiveRef.current && isSpeakingRef.current) {
           const buffer = await response.arrayBuffer();
-          if (isSessionActiveRef.current) {
+          if (isSessionActiveRef.current && isSpeakingRef.current) {
             await playAudioBuffer(buffer);
           }
           return;
@@ -672,7 +696,7 @@ export function useVoiceInterview() {
       }
     }
 
-    if (!isSessionActiveRef.current) return;
+    if (!isSessionActiveRef.current || !isSpeakingRef.current) return;
 
     // 4. Fallback: Browser Native Speech Synthesis
     if (typeof window !== 'undefined' && window.speechSynthesis) {
@@ -686,7 +710,7 @@ export function useVoiceInterview() {
         if (match) utterance.voice = match;
       }
 
-      utterance.rate = 1.02;
+      utterance.rate = VOICE_PLAYBACK_RATE; // 1.1x slightly faster!
       utterance.pitch = 1.0;
 
       if (chromeKeepAliveTimerRef.current) clearInterval(chromeKeepAliveTimerRef.current);
@@ -736,7 +760,7 @@ export function useVoiceInterview() {
       utterance.onend = cleanupSpeech;
       utterance.onerror = cleanupSpeech;
 
-      const estimatedDurationMs = Math.max(4000, (text.split(' ').length / 2.2) * 1000 + 3000);
+      const estimatedDurationMs = Math.max(4000, (text.split(' ').length / 2.4) * 1000 + 3000);
       ttsFallbackTimeoutRef.current = setTimeout(() => {
         if (isSpeakingRef.current && window.__activeUtterance === utterance) {
           cleanupSpeech();
@@ -767,9 +791,14 @@ export function useVoiceInterview() {
 
   // Turn evaluation & conversational progression
   const submitCandidateAnswer = useCallback(async (spokenText) => {
-    if (isProcessingTurnRef.current || !isSessionActiveRef.current || isSpeakingRef.current) return;
+    if (isProcessingTurnRef.current || !isSessionActiveRef.current) return;
     const cleanAnswer = spokenText.trim();
     if (!cleanAnswer || cleanAnswer.length < 2) return;
+
+    // If AI was still speaking when answer submitted, stop AI output immediately
+    if (isSpeakingRef.current) {
+      killAllVoiceOutput();
+    }
 
     isProcessingTurnRef.current = true;
     clearSpeechBuffers();
@@ -783,7 +812,7 @@ export function useVoiceInterview() {
     const currentQIndex = questionIndexRef.current;
     const currentHistory = historyRef.current;
 
-    // Allow user to switch or reset role by voice anytime (e.g. "switch role", "change position", "new interview")
+    // Allow user to switch or reset role by voice anytime
     const wantsNewRole = /\b(switch\s*role|change\s*(role|position|job)|different\s*(role|position|job)|new\s*interview|start\s*over)\b/i.test(cleanAnswer);
     if (wantsNewRole) {
       setRole('undecided');
@@ -866,7 +895,7 @@ Keep your entire response under 3 sentences, natural spoken English, zero markdo
       return;
     }
 
-    // PHASE 2: Active Interview Conversation & Coaching Mode (when user doesn't know an answer)
+    // PHASE 2: Active Interview Conversation & Coaching Mode
     const activeRoleTitle =
       currentCustomTitle ||
       PRESET_ROLES.find(r => r.id === currentRole)?.name ||
@@ -935,10 +964,9 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
     setHistory(prev => [...prev, { sender: 'ai', text: responseString }]);
     isProcessingTurnRef.current = false;
     speakText(responseString);
-  }, [clearSpeechBuffers, fetchGroqResponse, speakText]);
+  }, [clearSpeechBuffers, fetchGroqResponse, killAllVoiceOutput, speakText]);
 
-  // Audio Context, Mic Stream & Mobile Whisper Voice-Activity Recorder
-  // Reuses existing micStreamRef so clicking the bubble NEVER re-prompts for microphone permission!
+  // Audio Context, Mic Stream & Live Barge-In Interruption Detector
   const initializeAudioContext = useCallback(async () => {
     try {
       if (typeof window !== 'undefined' && !window.isSecureContext) {
@@ -965,7 +993,6 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
         });
         micStreamRef.current = stream;
       } else {
-        // Re-enable existing tracks without triggering browser permission prompt
         stream.getAudioTracks().forEach(t => { t.enabled = true; });
       }
 
@@ -1042,6 +1069,7 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
       const analyser = analyserRef.current;
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
       let lastVoiceTime = 0;
+      let bargeInFrames = 0;
 
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
 
@@ -1057,9 +1085,20 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
         const normalized = Math.min(average / 128, 1);
 
         const now = Date.now();
-        const isInCooldown = now < ignoreMicUntilRef.current;
 
-        if (!isSpeakingRef.current && !isInCooldown) {
+        // Instant Voice Barge-In Detection while AI is speaking:
+        // If AI has been speaking for >450ms and user speaks into the mic above threshold, cut off AI immediately!
+        if (isSpeakingRef.current) {
+          if (now - aiSpeechStartTimeRef.current > 450 && normalized > 0.14) {
+            bargeInFrames++;
+            if (bargeInFrames >= 3) {
+              bargeInFrames = 0;
+              interruptAiSpeech(true);
+            }
+          } else {
+            bargeInFrames = Math.max(0, bargeInFrames - 1);
+          }
+        } else {
           setAudioLevel(normalized);
 
           if (normalized > 0.08) {
@@ -1103,9 +1142,9 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
       }
       return true;
     }
-  }, [isMobileDevice, submitCandidateAnswer, transcribeAudioWithWhisper]);
+  }, [interruptAiSpeech, isMobileDevice, submitCandidateAnswer, transcribeAudioWithWhisper]);
 
-  // Speech Recognition (Web Speech API)
+  // Speech Recognition (Web Speech API) - Supports instant Barge-In Interruption when user talks over AI!
   const initializeSpeechRecognition = useCallback(() => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) return;
@@ -1123,12 +1162,7 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
     recognition.lang = 'en-US';
 
     recognition.onresult = (event) => {
-      if (
-        !isSessionActiveRef.current ||
-        isSpeakingRef.current ||
-        isProcessingTurnRef.current ||
-        Date.now() < ignoreMicUntilRef.current
-      ) {
+      if (!isSessionActiveRef.current || isProcessingTurnRef.current) {
         return;
       }
 
@@ -1141,6 +1175,25 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
         } else {
           interim += event.results[i][0].transcript;
         }
+      }
+
+      const incomingSpeech = (newlyFinal + ' ' + interim).trim();
+
+      // If AI is currently speaking and user starts talking:
+      if (isSpeakingRef.current) {
+        if (!incomingSpeech || incomingSpeech.length < 2) return;
+
+        // Ignore if mic only picked up a direct echo snippet of the AI's own sentence within first 600ms
+        const normIncoming = incomingSpeech.toLowerCase().trim();
+        const isEchoOfAi =
+          Date.now() - aiSpeechStartTimeRef.current < 600 &&
+          currentAiTextRef.current.includes(normIncoming);
+
+        if (isEchoOfAi) return;
+
+        // Genuine user interruption! Stop AI voice immediately and capture user's new speech!
+        killAllVoiceOutput();
+        setStatus('listening');
       }
 
       currentInterimRef.current = interim;
@@ -1199,21 +1252,25 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
     };
 
     recognition.onend = () => {
-      if (isSessionActiveRef.current && !isSpeakingRef.current && !isProcessingTurnRef.current) {
+      if (isSessionActiveRef.current && !isProcessingTurnRef.current) {
         setTimeout(() => {
-          if (isSessionActiveRef.current && !isSpeakingRef.current && recognitionRef.current === recognition) {
+          if (isSessionActiveRef.current && recognitionRef.current === recognition) {
             try {
               recognition.start();
             } catch (_) {}
           }
-        }, 150);
+        }, 140);
       }
     };
 
-    recognitionRef.current = recognition;
-  }, [isMobileDevice, submitCandidateAnswer]);
+    try {
+      recognition.start();
+    } catch (_) {}
 
-  // Start Session - Remembers previous session from browser storage/cookies!
+    recognitionRef.current = recognition;
+  }, [isMobileDevice, killAllVoiceOutput, submitCandidateAnswer]);
+
+  // Start or Resume Current Session
   const startInterview = async () => {
     isSessionActiveRef.current = true;
     isProcessingTurnRef.current = false;
@@ -1224,17 +1281,15 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
     initializeSpeechRecognition();
     clearSpeechBuffers();
 
-    // Check if this browser already has a remembered interview role & conversation
     const savedTitle = customRoleTitleRef.current;
     const savedPhase = interviewPhaseRef.current;
     const savedHistory = historyRef.current;
 
     if (savedPhase === 'interviewing' && savedTitle && savedHistory.length > 0) {
-      // Find the last AI question so we can smoothly welcome them back and resume
       const lastAiMsg = [...savedHistory].reverse().find(m => m.sender === 'ai');
       const resumeGreeting = lastAiMsg
-        ? `Welcome back to your ${savedTitle} interview! Let's pick up right where we left off, or say "switch role" if you want a new position. ${lastAiMsg.text}`
-        : `Welcome back! Ready to continue your ${savedTitle} interview, or would you like to switch roles?`;
+        ? `Welcome back to your ${savedTitle} interview! ${lastAiMsg.text}`
+        : `Welcome back! Ready to continue your ${savedTitle} interview?`;
 
       setHistory(prev => [...prev, { sender: 'ai', text: resumeGreeting }]);
       speakText(resumeGreeting);
@@ -1255,7 +1310,7 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
     speakText(welcome);
   };
 
-  // Stop Session - Pauses & mutes mic tracks instead of destroying them so next tap NEVER re-asks permission!
+  // Stop Session
   const stopInterview = useCallback((destroyHardwareTracks = false) => {
     isSessionActiveRef.current = false;
     isSpeakingRef.current = false;
@@ -1285,7 +1340,6 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
       recognitionRef.current = null;
     }
 
-    // Mute microphone tracks when stopping session, and only destroy tracks when unloading page
     if (micStreamRef.current) {
       try {
         if (destroyHardwareTracks === true) {
@@ -1320,6 +1374,87 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
     setAudioLevel(0);
     setAiResponse('');
   }, [clearSpeechBuffers, killAllVoiceOutput]);
+
+  // Create a brand new interview session (ChatGPT "New Chat" button)
+  const createNewInterviewSession = useCallback(() => {
+    stopInterview(false);
+    const fresh = createBlankSession();
+    setSessions(prev => {
+      const updated = [fresh, ...prev];
+      saveSessionsToBrowser(updated, fresh.id);
+      return updated;
+    });
+    setActiveSessionId(fresh.id);
+    setRole('undecided');
+    roleRef.current = 'undecided';
+    setCustomRoleTitle('');
+    customRoleTitleRef.current = '';
+    setInterviewPhase('greeting');
+    interviewPhaseRef.current = 'greeting';
+    setQuestionIndex(-1);
+    questionIndexRef.current = -1;
+    setHistory([]);
+    historyRef.current = [];
+  }, [stopInterview]);
+
+  // Switch to an older interview session from the sidebar
+  const selectInterviewSession = useCallback((sessionId) => {
+    const target = sessions.find(s => s.id === sessionId);
+    if (!target) return;
+    stopInterview(false);
+    setActiveSessionId(target.id);
+    setRole(target.role || 'undecided');
+    roleRef.current = target.role || 'undecided';
+    setCustomRoleTitle(target.customRoleTitle || '');
+    customRoleTitleRef.current = target.customRoleTitle || '';
+    setInterviewPhase(target.interviewPhase || 'greeting');
+    interviewPhaseRef.current = target.interviewPhase || 'greeting';
+    setQuestionIndex(typeof target.questionIndex === 'number' ? target.questionIndex : -1);
+    questionIndexRef.current = typeof target.questionIndex === 'number' ? target.questionIndex : -1;
+    setHistory(Array.isArray(target.history) ? target.history : []);
+    historyRef.current = Array.isArray(target.history) ? target.history : [];
+  }, [sessions, stopInterview]);
+
+  // Delete an interview session from the sidebar
+  const deleteInterviewSession = useCallback((sessionId) => {
+    setSessions(prev => {
+      const remaining = prev.filter(s => s.id !== sessionId);
+      if (remaining.length === 0) {
+        const fresh = createBlankSession();
+        setActiveSessionId(fresh.id);
+        setRole('undecided');
+        roleRef.current = 'undecided';
+        setCustomRoleTitle('');
+        customRoleTitleRef.current = '';
+        setInterviewPhase('greeting');
+        interviewPhaseRef.current = 'greeting';
+        setQuestionIndex(-1);
+        questionIndexRef.current = -1;
+        setHistory([]);
+        historyRef.current = [];
+        saveSessionsToBrowser([fresh], fresh.id);
+        return [fresh];
+      }
+      if (sessionId === activeSessionId) {
+        const nextActive = remaining[0];
+        setActiveSessionId(nextActive.id);
+        setRole(nextActive.role || 'undecided');
+        roleRef.current = nextActive.role || 'undecided';
+        setCustomRoleTitle(nextActive.customRoleTitle || '');
+        customRoleTitleRef.current = nextActive.customRoleTitle || '';
+        setInterviewPhase(nextActive.interviewPhase || 'greeting');
+        interviewPhaseRef.current = nextActive.interviewPhase || 'greeting';
+        setQuestionIndex(typeof nextActive.questionIndex === 'number' ? nextActive.questionIndex : -1);
+        questionIndexRef.current = typeof nextActive.questionIndex === 'number' ? nextActive.questionIndex : -1;
+        setHistory(Array.isArray(nextActive.history) ? nextActive.history : []);
+        historyRef.current = Array.isArray(nextActive.history) ? nextActive.history : [];
+        saveSessionsToBrowser(remaining, nextActive.id);
+      } else {
+        saveSessionsToBrowser(remaining, activeSessionId);
+      }
+      return remaining;
+    });
+  }, [activeSessionId]);
 
   const submitTypedAnswer = async (text) => {
     if (!text.trim()) return;
@@ -1370,6 +1505,13 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
     isSpeechRecognitionSupported,
     silenceProgress,
     micWarning,
+
+    // Multi-session History (ChatGPT-style sidebar)
+    sessions,
+    activeSessionId,
+    createNewInterviewSession,
+    selectInterviewSession,
+    deleteInterviewSession,
 
     voiceProvider,
     updateVoiceProvider,
