@@ -301,6 +301,19 @@ export function buildCustomRoleTree(customTitle) {
 // Generates thoughtful, natural interviewer follow-ups based on the user's spoken answer
 export function evaluateAnswer(userAnswer, questionData) {
   const normalized = userAnswer.toLowerCase();
+
+  // Detect if the user doesn't know the answer or asks for help
+  const isDontKnow = /\b(i\s*don't\s*know|i\s*do\s*not\s*know|not\s*sure|no\s*idea|i'm\s*unsure|can\s*you\s*explain|what\s*is\s*that|help\s*me|skip|pass|i\s*forgot|blanking)\b/i.test(normalized);
+  if (isDontKnow) {
+    const keyConcepts = (questionData.keywords || []).slice(0, 3).join(', ');
+    return {
+      assessment: 'coaching',
+      comment: `No problem at all! For ${questionData.topic}, interviewers are looking for how you think about concepts like ${keyConcepts}. A strong way to answer this is to briefly explain the core concept, mention a tool or pattern like ${questionData.keywords?.[0] || 'caching'}, and share one practical trade-off.`,
+      followUp: "Want to give that question a quick try using those points, or should we move to the next question?",
+      matchedCount: 0
+    };
+  }
+
   const matchedKeywords = (questionData.keywords || []).filter(kw => normalized.includes(kw));
   const wordCount = normalized.trim().split(/\s+/).length;
 

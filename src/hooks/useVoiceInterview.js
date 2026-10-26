@@ -11,25 +11,62 @@ import { ELEVENLABS_VOICES } from '../services/voiceProviders';
 
 const SILENCE_SUBMIT_MS = 1600; // 1.6s silence detection after speech ends
 const POST_SPEECH_COOLDOWN_MS = 650; // Ignore room echo for 0.65s right after AI finishes speaking
+const MEMORY_STORAGE_KEY = 'voice_interview_browser_memory_v1';
+
+// Helper to read/write persistent browser memory via both localStorage and Cookies (365 days)
+function loadBrowserMemory() {
+  try {
+    const localRaw = localStorage.getItem(MEMORY_STORAGE_KEY);
+    if (localRaw) {
+      return JSON.parse(localRaw);
+    }
+    const cookieMatch = document.cookie
+      .split('; ')
+      .find(row => row.startsWith(`${MEMORY_STORAGE_KEY}=`));
+    if (cookieMatch) {
+      return JSON.parse(decodeURIComponent(cookieMatch.split('=')[1]));
+    }
+  } catch (_) {}
+  return null;
+}
+
+function saveBrowserMemory(memoryData) {
+  try {
+    const serialized = JSON.stringify(memoryData);
+    localStorage.setItem(MEMORY_STORAGE_KEY, serialized);
+
+    // Also store a lightweight summary in a 1-year browser cookie so role & progress persist across sessions
+    const compactCookie = JSON.stringify({
+      role: memoryData.role,
+      customRoleTitle: memoryData.customRoleTitle,
+      interviewPhase: memoryData.interviewPhase,
+      questionIndex: memoryData.questionIndex,
+      updatedAt: memoryData.updatedAt
+    });
+    document.cookie = `${MEMORY_STORAGE_KEY}=${encodeURIComponent(compactCookie)}; path=/; max-age=31536000; SameSite=Lax`;
+  } catch (_) {}
+}
 
 export function useVoiceInterview() {
-  const [role, setRole] = useState('undecided');
-  const [customRoleTitle, setCustomRoleTitle] = useState('');
-  const [interviewPhase, setInterviewPhase] = useState('greeting'); // 'greeting' | 'interviewing'
+  const savedMem = useRef(loadBrowserMemory()).current;
+
+  const [role, setRole] = useState(savedMem?.role || 'undecided');
+  const [customRoleTitle, setCustomRoleTitle] = useState(savedMem?.customRoleTitle || '');
+  const [interviewPhase, setInterviewPhase] = useState(savedMem?.interviewPhase || 'greeting'); // 'greeting' | 'interviewing'
   const [status, setStatus] = useState('idle'); // 'idle' | 'listening' | 'thinking' | 'speaking' | 'interrupted'
   const [audioLevel, setAudioLevel] = useState(0);
   const [transcript, setTranscript] = useState('');
   const [interimTranscript, setInterimTranscript] = useState('');
   const [aiResponse, setAiResponse] = useState('');
-  const [history, setHistory] = useState([]);
-  const [questionIndex, setQuestionIndex] = useState(-1);
+  const [history, setHistory] = useState(Array.isArray(savedMem?.history) ? savedMem.history : []);
+  const [questionIndex, setQuestionIndex] = useState(typeof savedMem?.questionIndex === 'number' ? savedMem.questionIndex : -1);
   const [isSpeechRecognitionSupported, setIsSpeechRecognitionSupported] = useState(true);
   const [silenceProgress, setSilenceProgress] = useState(0);
   const [micWarning, setMicWarning] = useState('');
 
   // Voice Provider Configuration (Defaults to 'neural' ultra-low-latency Jenny Neural voice!)
   const [voiceProvider, setVoiceProvider] = useState(() => localStorage.getItem('melo_voice_provider') || 'neural');
-  const [neuralVoice, setNeuralVoice] = useState(() => 'en-US-JennyNeural');
+  const [neuralVoice] = useState(() => 'en-US-JennyNeural');
   const [elevenLabsKey, setElevenLabsKey] = useState(() => localStorage.getItem('melo_elevenlabs_key') || '');
   const [elevenLabsVoiceId, setElevenLabsVoiceId] = useState(() => localStorage.getItem('melo_elevenlabs_voice') || ELEVENLABS_VOICES[0].id);
   const [openAiKey, setOpenAiKey] = useState(() => localStorage.getItem('melo_openai_key') || '');
@@ -80,6 +117,18 @@ export function useVoiceInterview() {
   useEffect(() => { interviewPhaseRef.current = interviewPhase; }, [interviewPhase]);
   useEffect(() => { questionIndexRef.current = questionIndex; }, [questionIndex]);
   useEffect(() => { historyRef.current = history; }, [history]);
+
+  // Automatically persist interview state, role, and conversation history to browser storage + cookies
+  useEffect(() => {
+    saveBrowserMemory({
+      role,
+      customRoleTitle,
+      interviewPhase,
+      questionIndex,
+      history: history.slice(-16), // Keep last 16 turns in browser memory
+      updatedAt: Date.now()
+    });
+  }, [role, customRoleTitle, interviewPhase, questionIndex, history]);
 
   // Check SpeechRecognition browser support
   useEffect(() => {
@@ -237,7 +286,6 @@ export function useVoiceInterview() {
     const controller = new AbortController();
     abortControllerRef.current = controller;
 
-    // openai/gpt-oss-20b with reasoning_effort='low' responds in ~600ms and max_tokens=600 prevents mid-sentence truncation!
     const modelsToTry = [
       { id: 'openai/gpt-oss-20b', reasoning: 'low' },
       { id: 'openai/gpt-oss-120b', reasoning: 'low' }
@@ -258,7 +306,7 @@ export function useVoiceInterview() {
             reasoning_effort: modelCfg.reasoning,
             messages,
             temperature: 0.65,
-            max_tokens: 600
+            max_tokens: 650
           })
         });
 
@@ -296,7 +344,6 @@ export function useVoiceInterview() {
       if (res.ok) {
         const data = await res.json();
         const text = (data.text || '').trim();
-        // Filter out common Whisper silence/background noise hallucinations
         if (
           text.length < 3 ||
           /^(thank you\.?|thanks for watching\.?|you\.?|bye\.?|okay\.?|oh\.?|uh\.?|um\.?|hmm\.?|subtitles by.*|\.+)$/i.test(text)
@@ -318,7 +365,11 @@ export function useVoiceInterview() {
     setAudioLevel(0);
     clearSpeechBuffers();
 
-    // Ignore mic input for 0.9s after AI stops speaking so speaker echo isn't picked up as user answer!
+    // Unmute hardware microphone track now that AI finished speaking
+    if (micStreamRef.current) {
+      micStreamRef.current.getAudioTracks().forEach(t => { t.enabled = true; });
+    }
+
     ignoreMicUntilRef.current = Date.now() + POST_SPEECH_COOLDOWN_MS;
     setStatus('listening');
 
@@ -330,7 +381,7 @@ export function useVoiceInterview() {
           recognitionRef.current.start();
         } catch (_) {}
       }
-    }, 350);
+    }, 300);
   }, [clearSpeechBuffers]);
 
   // Play audio array buffer via Web Audio API
@@ -433,7 +484,7 @@ export function useVoiceInterview() {
     setAiResponse(text);
 
     // 0. Default Built-In Ultra-Fast Neural Voice (en-US-JennyNeural via /api/tts)
-    // Splits multi-sentence responses so Sentence 1 starts playing in ~0.4s while Sentence 2 prefetches in background!
+    // Splits multi-sentence responses so Sentence 1 starts playing in ~0.35s while Sentence 2 prefetches in background!
     if (voiceProvider === 'neural' || voiceProvider === 'browser') {
       try {
         const sentences = text
@@ -463,7 +514,6 @@ export function useVoiceInterview() {
             return;
           }
         } else {
-          // Fetch first sentence immediately + prefetch remaining sentence(s) in parallel!
           const firstChunkText = sentences[0];
           const restChunkText = sentences.slice(1).join(' ');
 
@@ -472,7 +522,6 @@ export function useVoiceInterview() {
 
           const firstBuffer = await firstPromise;
           if (firstBuffer && isSessionActiveRef.current) {
-            // Play first sentence and wait for it to finish before playing second sentence
             await new Promise((resolve) => {
               const playFirst = async () => {
                 if (!isSessionActiveRef.current || !audioContextRef.current) return resolve();
@@ -734,6 +783,25 @@ export function useVoiceInterview() {
     const currentQIndex = questionIndexRef.current;
     const currentHistory = historyRef.current;
 
+    // Allow user to switch or reset role by voice anytime (e.g. "switch role", "change position", "new interview")
+    const wantsNewRole = /\b(switch\s*role|change\s*(role|position|job)|different\s*(role|position|job)|new\s*interview|start\s*over)\b/i.test(cleanAnswer);
+    if (wantsNewRole) {
+      setRole('undecided');
+      roleRef.current = 'undecided';
+      setCustomRoleTitle('');
+      customRoleTitleRef.current = '';
+      setInterviewPhase('greeting');
+      interviewPhaseRef.current = 'greeting';
+      setQuestionIndex(-1);
+      questionIndexRef.current = -1;
+
+      const switchMsg = "Sure thing! What new job position or role would you like to interview for?";
+      setHistory(prev => [...prev, { sender: 'ai', text: switchMsg }]);
+      isProcessingTurnRef.current = false;
+      speakText(switchMsg);
+      return;
+    }
+
     // PHASE 1: Conversational Role Discovery
     if (currentPhase === 'greeting' || currentRole === 'undecided') {
       const detected = detectRoleFromSpeech(cleanAnswer);
@@ -798,15 +866,22 @@ Keep your entire response under 3 sentences, natural spoken English, zero markdo
       return;
     }
 
-    // PHASE 2: Active Interview Conversation
+    // PHASE 2: Active Interview Conversation & Coaching Mode (when user doesn't know an answer)
     const activeRoleTitle =
       currentCustomTitle ||
       PRESET_ROLES.find(r => r.id === currentRole)?.name ||
       'Software Engineer';
 
-    const systemPrompt = `You are an articulate, supportive human interviewer conducting a live voice interview for the ${activeRoleTitle} position.
-Speak in a warm, natural conversational tone. Keep your response concise (2 to 3 sentences max), spoken-friendly, with zero bullet points or markdown symbols.
-Briefly react to or evaluate the candidate's answer, and then ask the next relevant interview question or a deeper follow-up question for the ${activeRoleTitle} role.`;
+    const systemPrompt = `You are an articulate, supportive human interviewer and coach conducting a live voice interview for the ${activeRoleTitle} position.
+Speak in a warm, natural conversational tone with zero bullet points or markdown symbols.
+IMPORTANT COACHING RULE:
+1. If the user says they don't know, aren't sure, asks you to explain, or struggles with the question:
+   - First, warmly reassure them and clearly explain the concept in simple terms (1 to 2 sentences).
+   - Second, tell them how to properly structure a great interview answer for that question (1 sentence).
+   - Third, ask if they want to try answering it in their own words or move on to the next question.
+2. Otherwise, if the user answered the question:
+   - Briefly react to or validate their points (1 sentence), and ask the next relevant interview question for the ${activeRoleTitle} role (1 to 2 sentences).
+Keep your total response to 3 to 4 spoken sentences maximum so it flows naturally.`;
 
     const llmReply = await fetchGroqResponse([
       { role: 'system', content: systemPrompt },
@@ -843,7 +918,9 @@ Briefly react to or evaluate the candidate's answer, and then ask the next relev
       const currentQ = tree.questions[currentQIndex];
       const evaluation = evaluateAnswer(cleanAnswer, currentQ);
 
-      if (nextQIndex < tree.questions.length) {
+      if (evaluation.assessment === 'coaching') {
+        responseString = `${evaluation.comment} ${evaluation.followUp}`;
+      } else if (nextQIndex < tree.questions.length) {
         const nextQ = tree.questions[nextQIndex];
         responseString = `${evaluation.comment} Moving to our next question on ${nextQ.topic}: ${nextQ.prompt}`;
         setQuestionIndex(nextQIndex);
@@ -861,6 +938,7 @@ Briefly react to or evaluate the candidate's answer, and then ask the next relev
   }, [clearSpeechBuffers, fetchGroqResponse, speakText]);
 
   // Audio Context, Mic Stream & Mobile Whisper Voice-Activity Recorder
+  // Reuses existing micStreamRef so clicking the bubble NEVER re-prompts for microphone permission!
   const initializeAudioContext = useCallback(async () => {
     try {
       if (typeof window !== 'undefined' && !window.isSecureContext) {
@@ -873,16 +951,25 @@ Briefly react to or evaluate the candidate's answer, and then ask the next relev
         return true;
       }
 
-      // Request microphone FIRST inside user gesture
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        }
-      });
+      // Reuse already-granted microphone stream if still active so browser never asks for permission again!
+      let stream = micStreamRef.current;
+      const hasLiveTracks = stream && stream.getAudioTracks().some(t => t.readyState === 'live');
+
+      if (!hasLiveTracks) {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        });
+        micStreamRef.current = stream;
+      } else {
+        // Re-enable existing tracks without triggering browser permission prompt
+        stream.getAudioTracks().forEach(t => { t.enabled = true; });
+      }
+
       setMicWarning('');
-      micStreamRef.current = stream;
 
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
@@ -892,8 +979,6 @@ Briefly react to or evaluate the candidate's answer, and then ask the next relev
         await audioContextRef.current.resume();
       }
 
-      // Play a tiny 1-sample silent buffer inside the tap gesture so iOS/Android Chrome
-      // permanently unlocks Web Audio playback for all neural voice responses!
       try {
         const ctx = audioContextRef.current;
         const silentBuffer = ctx.createBuffer(1, 1, 22050);
@@ -910,17 +995,19 @@ Briefly react to or evaluate the candidate's answer, and then ask the next relev
       }
 
       const ctx = audioContextRef.current;
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 256;
-      analyser.smoothingTimeConstant = 0.3;
-      analyserRef.current = analyser;
+      if (!analyserRef.current) {
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 256;
+        analyser.smoothingTimeConstant = 0.3;
+        analyserRef.current = analyser;
 
-      const source = ctx.createMediaStreamSource(stream);
-      source.connect(analyser);
+        const source = ctx.createMediaStreamSource(stream);
+        source.connect(analyser);
+      }
 
       // MediaRecorder fallback ONLY for mobile devices where Web Speech API might fail
-      let recorder = null;
-      if (isMobileDevice && typeof window.MediaRecorder !== 'undefined') {
+      let recorder = mediaRecorderRef.current;
+      if (isMobileDevice && !recorder && typeof window.MediaRecorder !== 'undefined') {
         try {
           recorder = new MediaRecorder(stream);
           mediaRecorderRef.current = recorder;
@@ -952,8 +1039,11 @@ Briefly react to or evaluate the candidate's answer, and then ask the next relev
         }
       }
 
+      const analyser = analyserRef.current;
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
       let lastVoiceTime = 0;
+
+      if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
 
       const checkAudioLevel = () => {
         if (!analyserRef.current || !isSessionActiveRef.current) return;
@@ -972,8 +1062,6 @@ Briefly react to or evaluate the candidate's answer, and then ask the next relev
         if (!isSpeakingRef.current && !isInCooldown) {
           setAudioLevel(normalized);
 
-          // If user is actively making voice sounds while a 4-second silence timer is counting down,
-          // keep resetting the 4-second countdown so it NEVER cuts them off mid-thought!
           if (normalized > 0.08) {
             lastVoiceTime = now;
 
@@ -995,7 +1083,6 @@ Briefly react to or evaluate the candidate's answer, and then ask the next relev
             recorder.state === 'recording' &&
             now - lastVoiceTime > SILENCE_SUBMIT_MS
           ) {
-            // Wait full 4.0 seconds of silence before stopping mobile fallback recorder
             try {
               recorder.stop();
             } catch (_) {}
@@ -1018,7 +1105,7 @@ Briefly react to or evaluate the candidate's answer, and then ask the next relev
     }
   }, [isMobileDevice, submitCandidateAnswer, transcribeAudioWithWhisper]);
 
-  // Speech Recognition (Web Speech API) - Waits 4.0 full seconds after user stops talking
+  // Speech Recognition (Web Speech API)
   const initializeSpeechRecognition = useCallback(() => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) return;
@@ -1036,7 +1123,6 @@ Briefly react to or evaluate the candidate's answer, and then ask the next relev
     recognition.lang = 'en-US';
 
     recognition.onresult = (event) => {
-      // Strictly ignore any microphone results while AI is speaking or during post-speech echo cooldown!
       if (
         !isSessionActiveRef.current ||
         isSpeakingRef.current ||
@@ -1067,14 +1153,13 @@ Briefly react to or evaluate the candidate's answer, and then ask the next relev
         setInterimTranscript('');
       }
 
-      // Reset the 4-second silence timer every single time a word or syllable is heard
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
       if (silenceIntervalRef.current) clearInterval(silenceIntervalRef.current);
 
       const currentSpoken = (transcriptAccumulatorRef.current + ' ' + currentInterimRef.current).trim();
       if (currentSpoken.length > 1 && !isSpeakingRef.current && isSessionActiveRef.current) {
         const startTime = Date.now();
-        const duration = SILENCE_SUBMIT_MS; // 4000ms (4 seconds)
+        const duration = SILENCE_SUBMIT_MS;
 
         silenceIntervalRef.current = setInterval(() => {
           if (!isSessionActiveRef.current || isSpeakingRef.current) {
@@ -1128,7 +1213,7 @@ Briefly react to or evaluate the candidate's answer, and then ask the next relev
     recognitionRef.current = recognition;
   }, [isMobileDevice, submitCandidateAnswer]);
 
-  // Start Session
+  // Start Session - Remembers previous session from browser storage/cookies!
   const startInterview = async () => {
     isSessionActiveRef.current = true;
     isProcessingTurnRef.current = false;
@@ -1138,6 +1223,23 @@ Briefly react to or evaluate the candidate's answer, and then ask the next relev
 
     initializeSpeechRecognition();
     clearSpeechBuffers();
+
+    // Check if this browser already has a remembered interview role & conversation
+    const savedTitle = customRoleTitleRef.current;
+    const savedPhase = interviewPhaseRef.current;
+    const savedHistory = historyRef.current;
+
+    if (savedPhase === 'interviewing' && savedTitle && savedHistory.length > 0) {
+      // Find the last AI question so we can smoothly welcome them back and resume
+      const lastAiMsg = [...savedHistory].reverse().find(m => m.sender === 'ai');
+      const resumeGreeting = lastAiMsg
+        ? `Welcome back to your ${savedTitle} interview! Let's pick up right where we left off, or say "switch role" if you want a new position. ${lastAiMsg.text}`
+        : `Welcome back! Ready to continue your ${savedTitle} interview, or would you like to switch roles?`;
+
+      setHistory(prev => [...prev, { sender: 'ai', text: resumeGreeting }]);
+      speakText(resumeGreeting);
+      return;
+    }
 
     setRole('undecided');
     roleRef.current = 'undecided';
@@ -1153,8 +1255,8 @@ Briefly react to or evaluate the candidate's answer, and then ask the next relev
     speakText(welcome);
   };
 
-  // Stop Session - Immediately kills ALL voice, synthesis, streams, and timers
-  const stopInterview = useCallback(() => {
+  // Stop Session - Pauses & mutes mic tracks instead of destroying them so next tap NEVER re-asks permission!
+  const stopInterview = useCallback((destroyHardwareTracks = false) => {
     isSessionActiveRef.current = false;
     isSpeakingRef.current = false;
     isProcessingTurnRef.current = false;
@@ -1164,13 +1266,10 @@ Briefly react to or evaluate the candidate's answer, and then ask the next relev
 
     if (mediaRecorderRef.current) {
       try {
-        mediaRecorderRef.current.ondataavailable = null;
-        mediaRecorderRef.current.onstop = null;
         if (mediaRecorderRef.current.state !== 'inactive') {
           mediaRecorderRef.current.stop();
         }
       } catch (_) {}
-      mediaRecorderRef.current = null;
     }
     audioChunksRef.current = [];
     isRecordingChunkRef.current = false;
@@ -1186,18 +1285,30 @@ Briefly react to or evaluate the candidate's answer, and then ask the next relev
       recognitionRef.current = null;
     }
 
+    // Mute microphone tracks when stopping session, and only destroy tracks when unloading page
     if (micStreamRef.current) {
       try {
-        micStreamRef.current.getTracks().forEach(track => track.stop());
+        if (destroyHardwareTracks === true) {
+          micStreamRef.current.getTracks().forEach(track => track.stop());
+          micStreamRef.current = null;
+        } else {
+          micStreamRef.current.getAudioTracks().forEach(track => {
+            track.enabled = false;
+          });
+        }
       } catch (_) {}
-      micStreamRef.current = null;
     }
 
-    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+    if (destroyHardwareTracks === true && audioContextRef.current && audioContextRef.current.state !== 'closed') {
       try {
         audioContextRef.current.close();
       } catch (_) {}
       audioContextRef.current = null;
+      analyserRef.current = null;
+    } else if (audioContextRef.current && audioContextRef.current.state === 'running') {
+      try {
+        audioContextRef.current.suspend();
+      } catch (_) {}
     }
 
     if (rafIdRef.current) {
@@ -1228,7 +1339,7 @@ Briefly react to or evaluate the candidate's answer, and then ask the next relev
       if (typeof window !== 'undefined' && window.speechSynthesis) {
         window.speechSynthesis.cancel();
       }
-      stopInterview();
+      stopInterview(true);
     };
 
     window.addEventListener('beforeunload', handlePageUnload);
@@ -1237,7 +1348,7 @@ Briefly react to or evaluate the candidate's answer, and then ask the next relev
     return () => {
       window.removeEventListener('beforeunload', handlePageUnload);
       window.removeEventListener('pagehide', handlePageUnload);
-      stopInterview();
+      stopInterview(true);
     };
   }, [stopInterview]);
 
