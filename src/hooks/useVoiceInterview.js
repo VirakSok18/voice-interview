@@ -635,47 +635,27 @@ export function useVoiceInterview() {
     isSpeakingRef.current = true;
     aiSpeechStartTimeRef.current = Date.now();
     currentAiTextRef.current = text.toLowerCase();
-    setStatus('speaking');
-    const initialLines = splitIntoMovieLines(text);
-    setAiResponse(initialLines[0] || text);
+    // Keep status as 'thinking' until the audio buffer is decoded and ready to play,
+    // so the subtitle never flashes prematurely or conflicts before the voice actually starts!
 
     // 0. Default Built-In Ultra-Fast Neural Voice (en-US-JennyNeural via /api/tts at 1.1x playback rate)
-    // Pipelined sentence synthesis: starts playing sentence 1 immediately (~0.35s) while sentence 2 fetches in the background!
+    // Synthesizes the entire response in a single clean call (~0.6s) and shows each movie subtitle line ONLY at the exact millisecond the voice speaks it!
     if (voiceProvider === 'neural' || voiceProvider === 'browser') {
       try {
-        const sentences = splitIntoSentences(text);
-        if (sentences.length > 0) {
-          const fetchSentenceAudio = async (sentence) => {
-            const response = await fetch('/api/tts', {
-              method: 'POST',
-              signal: controller.signal,
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                text: sentence,
-                voice: neuralVoice || 'en-US-JennyNeural'
-              })
-            });
-            if (!response.ok) throw new Error(`TTS status ${response.status}`);
-            const buffer = await response.arrayBuffer();
-            if (!buffer || buffer.byteLength < 300) throw new Error('Empty TTS buffer');
-            return buffer;
-          };
+        const response = await fetch('/api/tts', {
+          method: 'POST',
+          signal: controller.signal,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text,
+            voice: neuralVoice || 'en-US-JennyNeural'
+          })
+        });
 
-          const audioPromises = sentences.map(s => fetchSentenceAudio(s));
-          let playedAny = false;
-
-          for (let i = 0; i < audioPromises.length; i++) {
-            if (!isSessionActiveRef.current || !isSpeakingRef.current) return;
-            const buffer = await audioPromises[i];
-            if (!isSessionActiveRef.current || !isSpeakingRef.current) return;
-            playedAny = true;
-            await playSingleBufferWithSubtitles(buffer, sentences[i]);
-          }
-
-          if (playedAny) {
-            if (isSessionActiveRef.current && isSpeakingRef.current) {
-              resumeListeningAfterAiSpeech();
-            }
+        if (response.ok && isSessionActiveRef.current && isSpeakingRef.current) {
+          const buffer = await response.arrayBuffer();
+          if (buffer && buffer.byteLength > 300 && isSessionActiveRef.current && isSpeakingRef.current) {
+            await playAudioBuffer(buffer, text);
             return;
           }
         }
@@ -795,7 +775,9 @@ export function useVoiceInterview() {
       utterance.pitch = 1.0;
 
       // Sync movie subtitle lines using estimated timing or boundary events
+      setStatus('speaking');
       const lines = splitIntoMovieLines(text);
+      if (lines.length > 0) setAiResponse(lines[0]);
       const estTotalMs = Math.max(1500, (text.split(/\s+/).length / 2.8) * 1000);
       const totalChars = lines.reduce((sum, l) => sum + l.length, 0) || 1;
       let elapsedMs = 0;
