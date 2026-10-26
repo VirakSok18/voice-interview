@@ -3,6 +3,25 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts'
 
+let sharedLocalTts = null;
+let sharedLocalVoice = null;
+
+async function synthesizeLocal(text, voice) {
+  if (!sharedLocalTts || sharedLocalVoice !== voice) {
+    sharedLocalTts = new MsEdgeTTS();
+    await sharedLocalTts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+    sharedLocalVoice = voice;
+  }
+  const { audioStream } = sharedLocalTts.toStream(text);
+  const chunks = [];
+  await new Promise((resolve, reject) => {
+    audioStream.on('data', (c) => chunks.push(c));
+    audioStream.on('end', resolve);
+    audioStream.on('error', reject);
+  });
+  return Buffer.concat(chunks);
+}
+
 // Built-in Vite middleware so /api/tts works in local dev AND on Vercel seamlessly
 function edgeNeuralTtsPlugin() {
   return {
@@ -31,25 +50,20 @@ function edgeNeuralTtsPlugin() {
             return;
           }
 
-          const tts = new MsEdgeTTS();
-          await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
-          const { audioStream } = tts.toStream(text.trim());
-          const chunks = [];
-
-          await new Promise((resolve, reject) => {
-            audioStream.on('data', (c) => chunks.push(c));
-            audioStream.on('end', resolve);
-            audioStream.on('error', reject);
-          });
-
-          const buf = Buffer.concat(chunks);
-          try { tts.close(); } catch (_) {}
+          let buf;
+          try {
+            buf = await synthesizeLocal(text.trim(), voice);
+          } catch (_) {
+            sharedLocalTts = null;
+            buf = await synthesizeLocal(text.trim(), voice);
+          }
 
           res.setHeader('Content-Type', 'audio/mpeg');
           res.setHeader('Content-Length', buf.length);
           res.end(buf);
         } catch (err) {
           console.error('Local Edge TTS error:', err);
+          sharedLocalTts = null;
           res.statusCode = 500;
           res.end(JSON.stringify({ error: 'TTS error' }));
         }

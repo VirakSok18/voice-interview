@@ -230,16 +230,20 @@ export function useVoiceInterview() {
     setAudioLevel(0);
   }, []);
 
-  // Helper to call Groq LLM with automatic model fallback
+  // Helper to call Groq LLM with fast low-latency model and generous token budget so it never cuts off mid-sentence
   const fetchGroqResponse = useCallback(async (messages) => {
     if (!groqKey.trim() || !isSessionActiveRef.current) return null;
 
     const controller = new AbortController();
     abortControllerRef.current = controller;
 
-    const modelsToTry = ['openai/gpt-oss-120b', 'llama-3.3-70b-versatile', 'llama-3.1-8b-instant'];
+    // openai/gpt-oss-20b with reasoning_effort='low' responds in ~600ms and max_tokens=600 prevents mid-sentence truncation!
+    const modelsToTry = [
+      { id: 'openai/gpt-oss-20b', reasoning: 'low' },
+      { id: 'openai/gpt-oss-120b', reasoning: 'low' }
+    ];
 
-    for (const modelName of modelsToTry) {
+    for (const modelCfg of modelsToTry) {
       if (!isSessionActiveRef.current) return null;
       try {
         const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -250,10 +254,11 @@ export function useVoiceInterview() {
             'Authorization': `Bearer ${groqKey.trim()}`
           },
           body: JSON.stringify({
-            model: modelName,
+            model: modelCfg.id,
+            reasoning_effort: modelCfg.reasoning,
             messages,
-            temperature: 0.7,
-            max_tokens: 180
+            temperature: 0.65,
+            max_tokens: 600
           })
         });
 
