@@ -9,8 +9,8 @@ import {
 } from '../services/interviewKnowledge';
 import { ELEVENLABS_VOICES } from '../services/voiceProviders';
 
-const SILENCE_SUBMIT_MS = 2500; // Wait 2.5 seconds after user stops talking before submitting
-const POST_SPEECH_COOLDOWN_MS = 900; // Ignore room echo for 0.9s right after AI finishes speaking
+const SILENCE_SUBMIT_MS = 1600; // 1.6s silence detection after speech ends
+const POST_SPEECH_COOLDOWN_MS = 650; // Ignore room echo for 0.65s right after AI finishes speaking
 
 export function useVoiceInterview() {
   const [role, setRole] = useState('undecided');
@@ -27,9 +27,9 @@ export function useVoiceInterview() {
   const [silenceProgress, setSilenceProgress] = useState(0);
   const [micWarning, setMicWarning] = useState('');
 
-  // Voice Provider Configuration (Defaults to 'neural' ultra-realistic Ava Neural voice!)
+  // Voice Provider Configuration (Defaults to 'neural' ultra-low-latency Jenny Neural voice!)
   const [voiceProvider, setVoiceProvider] = useState(() => localStorage.getItem('melo_voice_provider') || 'neural');
-  const [neuralVoice, setNeuralVoice] = useState(() => localStorage.getItem('melo_neural_voice') || 'en-US-AvaMultilingualNeural');
+  const [neuralVoice, setNeuralVoice] = useState(() => 'en-US-JennyNeural');
   const [elevenLabsKey, setElevenLabsKey] = useState(() => localStorage.getItem('melo_elevenlabs_key') || '');
   const [elevenLabsVoiceId, setElevenLabsVoiceId] = useState(() => localStorage.getItem('melo_elevenlabs_voice') || ELEVENLABS_VOICES[0].id);
   const [openAiKey, setOpenAiKey] = useState(() => localStorage.getItem('melo_openai_key') || '');
@@ -432,27 +432,97 @@ export function useVoiceInterview() {
     setStatus('speaking');
     setAiResponse(text);
 
-    // 0. Default Built-In Ultra-Natural Neural Voice (Microsoft Ava / Aria / Jenny Neural via /api/tts)
-    // Works on all browsers & phones (Chrome, Safari, Android, iOS) with zero API keys!
+    // 0. Default Built-In Ultra-Fast Neural Voice (en-US-JennyNeural via /api/tts)
+    // Splits multi-sentence responses so Sentence 1 starts playing in ~0.4s while Sentence 2 prefetches in background!
     if (voiceProvider === 'neural' || voiceProvider === 'browser') {
       try {
-        const response = await fetch('/api/tts', {
-          method: 'POST',
-          signal: controller.signal,
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            text,
-            voice: neuralVoice || 'en-US-AvaMultilingualNeural'
-          })
-        });
+        const sentences = text
+          .match(/[^.!?]+[.!?]+(?:\s|$)|[^.!?]+$/g)
+          ?.map(s => s.trim())
+          .filter(Boolean) || [text];
 
-        if (response.ok && isSessionActiveRef.current) {
-          const buffer = await response.arrayBuffer();
-          if (buffer && buffer.byteLength > 500 && isSessionActiveRef.current) {
+        const fetchSentenceAudio = async (sentenceText) => {
+          const response = await fetch('/api/tts', {
+            method: 'POST',
+            signal: controller.signal,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              text: sentenceText,
+              voice: neuralVoice || 'en-US-JennyNeural'
+            })
+          });
+          if (!response.ok) return null;
+          const buf = await response.arrayBuffer();
+          return buf && buf.byteLength > 300 ? buf : null;
+        };
+
+        if (sentences.length <= 1) {
+          const buffer = await fetchSentenceAudio(text);
+          if (buffer && isSessionActiveRef.current) {
             await playAudioBuffer(buffer);
             return;
+          }
+        } else {
+          // Fetch first sentence immediately + prefetch remaining sentence(s) in parallel!
+          const firstChunkText = sentences[0];
+          const restChunkText = sentences.slice(1).join(' ');
+
+          const firstPromise = fetchSentenceAudio(firstChunkText);
+          const restPromise = fetchSentenceAudio(restChunkText);
+
+          const firstBuffer = await firstPromise;
+          if (firstBuffer && isSessionActiveRef.current) {
+            // Play first sentence and wait for it to finish before playing second sentence
+            await new Promise((resolve) => {
+              const playFirst = async () => {
+                if (!isSessionActiveRef.current || !audioContextRef.current) return resolve();
+                const ctx = audioContextRef.current;
+                if (ctx.state === 'suspended') await ctx.resume();
+                try {
+                  const audioBuffer = await ctx.decodeAudioData(firstBuffer);
+                  if (!isSessionActiveRef.current) return resolve();
+                  const source = ctx.createBufferSource();
+                  source.buffer = audioBuffer;
+                  const ttsAnalyser = ctx.createAnalyser();
+                  ttsAnalyser.fftSize = 256;
+                  source.connect(ttsAnalyser);
+                  ttsAnalyser.connect(ctx.destination);
+                  activeAudioSourceRef.current = source;
+                  isSpeakingRef.current = true;
+                  setStatus('speaking');
+
+                  const ttsData = new Uint8Array(ttsAnalyser.frequencyBinCount);
+                  if (ttsPulseIntervalRef.current) clearInterval(ttsPulseIntervalRef.current);
+                  ttsPulseIntervalRef.current = setInterval(() => {
+                    if (!isSpeakingRef.current || !isSessionActiveRef.current) {
+                      clearInterval(ttsPulseIntervalRef.current);
+                      ttsPulseIntervalRef.current = null;
+                      return;
+                    }
+                    ttsAnalyser.getByteFrequencyData(ttsData);
+                    let s = 0;
+                    for (let i = 0; i < ttsData.length; i++) s += ttsData[i];
+                    setAudioLevel(Math.min((s / ttsData.length) / 100, 1));
+                  }, 50);
+
+                  source.onended = () => resolve();
+                  source.start(0);
+                } catch (_) {
+                  resolve();
+                }
+              };
+              playFirst();
+            });
+
+            if (!isSessionActiveRef.current) return;
+            const restBuffer = await restPromise;
+            if (restBuffer && isSessionActiveRef.current) {
+              await playAudioBuffer(restBuffer);
+              return;
+            } else {
+              resumeListeningAfterAiSpeech();
+              return;
+            }
           }
         }
       } catch (err) {

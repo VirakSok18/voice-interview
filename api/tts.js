@@ -1,6 +1,6 @@
 import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
 
-// Reuse a warm singleton WebSocket connection across serverless invocations for instant (<250ms) TTS
+// Reuse a warm singleton WebSocket connection with ultra-low-latency en-US-JennyNeural (~220ms first chunk!)
 let sharedTts = null;
 let currentVoice = null;
 
@@ -38,7 +38,7 @@ export default async function handler(req, res) {
 
   try {
     const text = (req.body?.text || req.query?.text || '').toString().trim();
-    const voice = (req.body?.voice || req.query?.voice || 'en-US-AvaMultilingualNeural').toString();
+    const voice = (req.body?.voice || req.query?.voice || 'en-US-JennyNeural').toString();
 
     if (!text) {
       return res.status(400).json({ error: 'Missing text parameter' });
@@ -48,14 +48,13 @@ export default async function handler(req, res) {
     try {
       audioBuffer = await synthesizeBuffer(text, voice);
     } catch (_) {
-      // Reconnect once if warm WebSocket closed
       sharedTts = null;
       audioBuffer = await synthesizeBuffer(text, voice);
     }
 
     res.setHeader('Content-Type', 'audio/mpeg');
     res.setHeader('Content-Length', audioBuffer.length);
-    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
     return res.status(200).send(audioBuffer);
   } catch (err) {
     console.error('Edge Neural TTS error:', err);

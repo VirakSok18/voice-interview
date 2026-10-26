@@ -31,7 +31,7 @@ function edgeNeuralTtsPlugin() {
         try {
           const url = new URL(req.url, 'http://localhost');
           let text = url.searchParams.get('text') || '';
-          let voice = url.searchParams.get('voice') || 'en-US-AvaMultilingualNeural';
+          let voice = url.searchParams.get('voice') || 'en-US-JennyNeural';
 
           if (req.method === 'POST') {
             const bodyChunks = [];
