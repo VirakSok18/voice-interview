@@ -231,32 +231,32 @@ export default function App() {
       {/* Movie-Style Line-by-Line Subtitle Display Directly Below Bubble */}
       <div className="relative z-20 w-full max-w-2xl h-[24dvh] flex flex-col items-center justify-center text-center px-4 pointer-events-none">
         {!isSessionActive ? (
-          <p className="text-base sm:text-xl text-slate-400 font-medium tracking-wide">
+          <p className="subtitle-stroke text-base sm:text-xl text-slate-300 font-semibold tracking-wide">
             {customRoleTitle && history.length > 0
               ? `Tap the bubble to continue your ${customRoleTitle} interview`
               : 'Tap the bubble to start talking'}
           </p>
         ) : micWarning ? (
-          <p className="text-sm sm:text-base text-amber-300 font-medium leading-relaxed">
+          <p className="subtitle-stroke text-sm sm:text-base text-amber-300 font-semibold leading-relaxed">
             {micWarning}
           </p>
         ) : liveUserText ? (
-          <p className="text-lg sm:text-2xl text-emerald-300 font-semibold leading-relaxed tracking-tight drop-shadow-[0_2px_12px_rgba(0,0,0,0.95)] transition-all duration-150">
+          <p className="subtitle-stroke text-lg sm:text-2xl text-emerald-300 font-bold leading-relaxed tracking-tight transition-all duration-150">
             {getLiveUserMovieLine(liveUserText)}
           </p>
         ) : status === 'thinking' ? (
-          <p className="text-lg sm:text-xl text-cyan-300/90 font-medium leading-relaxed animate-pulse">
+          <p className="subtitle-stroke text-lg sm:text-xl text-cyan-300 font-semibold leading-relaxed animate-pulse">
             ...
           </p>
         ) : aiResponse ? (
           <p
             key={aiResponse}
-            className="text-lg sm:text-2xl text-white font-semibold leading-relaxed tracking-tight drop-shadow-[0_2px_14px_rgba(0,0,0,0.95)] animate-in fade-in duration-150"
+            className="subtitle-stroke text-lg sm:text-2xl text-white font-bold leading-relaxed tracking-tight animate-in fade-in duration-150"
           >
             {aiResponse}
           </p>
         ) : (
-          <p className="text-base sm:text-xl text-slate-400 font-medium leading-relaxed">
+          <p className="subtitle-stroke text-base sm:text-xl text-slate-300 font-semibold leading-relaxed">
             Listening...
           </p>
         )}

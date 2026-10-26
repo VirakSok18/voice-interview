@@ -162,7 +162,10 @@ export function useVoiceInterview() {
   const questionIndexRef = useRef(questionIndex);
   const historyRef = useRef(history);
 
-  const isMobileDevice = typeof navigator !== 'undefined' && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const isMobileDevice =
+    typeof navigator !== 'undefined' &&
+    (/Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1));
 
   useEffect(() => { roleRef.current = role; }, [role]);
   useEffect(() => { customRoleTitleRef.current = customRoleTitle; }, [customRoleTitle]);
@@ -196,10 +199,30 @@ export function useVoiceInterview() {
     });
   }, [activeSessionId, role, customRoleTitle, interviewPhase, questionIndex, history]);
 
-  // Check SpeechRecognition browser support
+  // If the user already granted microphone permission to this site previously,
+  // pre-warm the microphone stream quietly so it never asks or delays when starting a conversation!
   useEffect(() => {
-    const hasSpeechRec = typeof window !== 'undefined' && Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
-    setIsSpeechRecognitionSupported(hasSpeechRec);
+    if (typeof navigator !== 'undefined' && navigator.permissions && navigator.permissions.query) {
+      navigator.permissions
+        .query({ name: 'microphone' })
+        .then((permStatus) => {
+          if (permStatus.state === 'granted' && !micStreamRef.current && navigator.mediaDevices?.getUserMedia) {
+            navigator.mediaDevices
+              .getUserMedia({
+                audio: {
+                  echoCancellation: true,
+                  noiseSuppression: true,
+                  autoGainControl: true
+                }
+              })
+              .then((stream) => {
+                micStreamRef.current = stream;
+              })
+              .catch(() => {});
+          }
+        })
+        .catch(() => {});
+    }
   }, []);
 
   // Initialize and select the best natural female American browser voice
@@ -1479,9 +1502,12 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
     setAiResponse('');
   }, [clearSpeechBuffers, killAllVoiceOutput]);
 
-  // Create a brand new interview session (ChatGPT "New Chat" button)
-  const createNewInterviewSession = useCallback(() => {
-    stopInterview(false);
+  // Create a brand new interview session (Starts immediately without stopping/re-requesting the mic!)
+  const createNewInterviewSession = useCallback(async () => {
+    killAllVoiceOutput();
+    clearSpeechBuffers();
+    isProcessingTurnRef.current = false;
+
     const fresh = createBlankSession();
     setSessions(prev => {
       const updated = [fresh, ...prev];
@@ -1497,15 +1523,31 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
     interviewPhaseRef.current = 'greeting';
     setQuestionIndex(-1);
     questionIndexRef.current = -1;
-    setHistory([]);
-    historyRef.current = [];
-  }, [stopInterview]);
 
-  // Switch to an older interview session from the sidebar
-  const selectInterviewSession = useCallback((sessionId) => {
+    const welcome = CONVERSATIONAL_GREETING;
+    setHistory([{ sender: 'ai', text: welcome }]);
+    historyRef.current = [{ sender: 'ai', text: welcome }];
+
+    // If mic is already initialized, immediately speak the new greeting without any extra tap!
+    if (micStreamRef.current) {
+      isSessionActiveRef.current = true;
+      await initializeAudioContext();
+      initializeSpeechRecognition();
+      speakText(welcome);
+    } else {
+      setStatus('idle');
+      setAiResponse('');
+    }
+  }, [clearSpeechBuffers, initializeAudioContext, initializeSpeechRecognition, killAllVoiceOutput, speakText]);
+
+  // Switch to an older interview session from the sidebar (keeps mic stream alive!)
+  const selectInterviewSession = useCallback(async (sessionId) => {
     const target = sessions.find(s => s.id === sessionId);
     if (!target) return;
-    stopInterview(false);
+    killAllVoiceOutput();
+    clearSpeechBuffers();
+    isProcessingTurnRef.current = false;
+
     setActiveSessionId(target.id);
     setRole(target.role || 'undecided');
     roleRef.current = target.role || 'undecided';
@@ -1515,9 +1557,22 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
     interviewPhaseRef.current = target.interviewPhase || 'greeting';
     setQuestionIndex(typeof target.questionIndex === 'number' ? target.questionIndex : -1);
     questionIndexRef.current = typeof target.questionIndex === 'number' ? target.questionIndex : -1;
-    setHistory(Array.isArray(target.history) ? target.history : []);
-    historyRef.current = Array.isArray(target.history) ? target.history : [];
-  }, [sessions, stopInterview]);
+    const targetHistory = Array.isArray(target.history) ? target.history : [];
+    setHistory(targetHistory);
+    historyRef.current = targetHistory;
+
+    if (micStreamRef.current) {
+      isSessionActiveRef.current = true;
+      await initializeAudioContext();
+      initializeSpeechRecognition();
+      const lastAiMsg = [...targetHistory].reverse().find(m => m.sender === 'ai');
+      const resumeText = lastAiMsg ? lastAiMsg.text : CONVERSATIONAL_GREETING;
+      speakText(resumeText);
+    } else {
+      setStatus('idle');
+      setAiResponse('');
+    }
+  }, [clearSpeechBuffers, initializeAudioContext, initializeSpeechRecognition, killAllVoiceOutput, sessions, speakText]);
 
   // Delete an interview session from the sidebar
   const deleteInterviewSession = useCallback((sessionId) => {
