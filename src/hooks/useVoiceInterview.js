@@ -1211,20 +1211,31 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
             audioChunksRef.current = [];
             if (shouldDiscard || !isSessionActiveRef.current || isProcessingTurnRef.current) return;
 
-            // Require at least ~400ms (24 frames) of actual close-mic human voice
-            if (spokenFrames < 24) return;
+            // Require at least ~250ms (15 frames) of close-mic human voice
+            if (spokenFrames < 15) return;
 
             // Syllabic speech vs. continuous background song check:
-            // If recording lasted >2.5s (150 frames) with almost zero natural syllable/word pauses (<8% gap frames),
+            // If recording lasted >2s (120 frames) with almost zero natural syllable/word pauses (<7% gap frames),
             // it's a continuous song/music stream in the background — reject it!
-            if (totalFrames > 150 && gapFrames / totalFrames < 0.08) {
+            if (totalFrames > 120 && gapFrames / totalFrames < 0.07) {
               return;
             }
 
             if (chunks.length > 0) {
               const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+
+              // Show immediate 'thinking' (...) indicator on mobile while Whisper transcribes (~0.25s) so it feels instant!
+              if (!isSpeakingRef.current && !wasBargeInCheck) {
+                setStatus('thinking');
+              }
+
               const whisperText = await transcribeAudioWithWhisper(blob);
-              if (!whisperText || !isSessionActiveRef.current || isProcessingTurnRef.current) return;
+              if (!whisperText || !isSessionActiveRef.current || isProcessingTurnRef.current) {
+                if (!isSpeakingRef.current && isSessionActiveRef.current && !isProcessingTurnRef.current) {
+                  setStatus('listening');
+                }
+                return;
+              }
 
               // If the AI was speaking while this mobile audio was recorded, verify it's a real user phrase (not noise or AI echo!) before interrupting!
               if (isSpeakingRef.current || wasBargeInCheck) {
@@ -1321,28 +1332,30 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
 
         // Continuously adapt ambient noise/music floor:
         // On mobile phones (which have aggressive hardware AGC that boosts background songs),
-        // if sound stays continuously elevated without syllable gaps for >1.5s (90 frames), lock the noise floor directly onto the song!
+        // if sound stays continuously elevated without syllable gaps for >0.8s (48 frames), lock the noise floor directly onto the song!
         const currentFloor = ambientNoiseFloorRef.current;
-        if (normalized > currentFloor + 0.04) {
+        if (normalized > currentFloor + 0.03) {
           continuousSoundFrames++;
         } else {
           continuousSoundFrames = Math.max(0, continuousSoundFrames - 3);
         }
 
         if (normalized < currentFloor) {
-          ambientNoiseFloorRef.current = currentFloor * 0.92 + normalized * 0.08;
-        } else if (isMobileDevice && continuousSoundFrames > 90) {
-          // Continuous song/music detected on mobile! Rapidly raise the floor to match the song so it stops capturing!
-          ambientNoiseFloorRef.current = Math.min(0.68, currentFloor * 0.88 + normalized * 0.12);
-        } else if (normalized < currentFloor + (isMobileDevice ? 0.32 : 0.22)) {
+          // Drop back down quickly on mobile as soon as the user finishes a word/sentence so the silence timer triggers right away!
+          const dropKeep = isMobileDevice ? 0.85 : 0.92;
+          ambientNoiseFloorRef.current = currentFloor * dropKeep + normalized * (1 - dropKeep);
+        } else if (isMobileDevice && continuousSoundFrames > 48 && !isRecordingChunkRef.current) {
+          // Continuous song/music detected on mobile while idle! Rapidly raise the floor to match the song so it never starts capturing it!
+          ambientNoiseFloorRef.current = Math.min(0.68, currentFloor * 0.82 + normalized * 0.18);
+        } else if (!isRecordingChunkRef.current && normalized < currentFloor + (isMobileDevice ? 0.32 : 0.22)) {
           ambientNoiseFloorRef.current = Math.min(isMobileDevice ? 0.65 : 0.55, currentFloor * 0.96 + normalized * 0.04);
         }
 
         const now = Date.now();
         // Phone mics are much more sensitive than desktop mics, so require a higher close-mic vocal threshold on mobile!
-        const minVoiceGate = isMobileDevice ? 0.26 : 0.14;
-        const minBargeGate = isMobileDevice ? 0.32 : 0.19;
-        const floorMargin = isMobileDevice ? 0.15 : 0.11;
+        const minVoiceGate = isMobileDevice ? 0.24 : 0.14;
+        const minBargeGate = isMobileDevice ? 0.30 : 0.19;
+        const floorMargin = isMobileDevice ? 0.14 : 0.11;
         const dynamicVoiceThreshold = Math.max(minVoiceGate, ambientNoiseFloorRef.current + floorMargin);
         const dynamicBargeInThreshold = Math.max(minBargeGate, ambientNoiseFloorRef.current + floorMargin + 0.04);
 
@@ -1353,7 +1366,7 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
         // Mobile Barge-In: NEVER kill AI voice on raw volume alone (which could be a cough, tap, cafe noise, or phone speaker bleed)!
         // Instead, record the candidate speech while AI continues speaking, and only interrupt once Whisper confirms a real 2+ word phrase!
         if (isSpeakingRef.current) {
-          if (isMobileDevice && now - aiSpeechStartTimeRef.current > 800 && normalized > dynamicBargeInThreshold && !isMusicDominated) {
+          if (isMobileDevice && now - aiSpeechStartTimeRef.current > 600 && normalized > dynamicBargeInThreshold && !isMusicDominated) {
             lastVoiceTime = now;
             bargeInFrames++;
             if (isRecordingChunkRef.current) {
@@ -1361,7 +1374,7 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
               totalRecordingFramesCount++;
             }
             if (
-              bargeInFrames >= 14 &&
+              bargeInFrames >= 9 &&
               recorder &&
               recorder.state === 'inactive' &&
               !isRecordingChunkRef.current &&
@@ -1391,7 +1404,7 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
               isVerifyingBargeIn &&
               recorder &&
               recorder.state === 'recording' &&
-              (now - lastVoiceTime > 650 || now - recordingStartTime > 4500)
+              (now - lastVoiceTime > 480 || now - recordingStartTime > 3200)
             ) {
               try {
                 recorder.stop();
@@ -1405,7 +1418,7 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
             : 0;
           setAudioLevel(visualLevel);
 
-          // Require genuine close-mic voice above background song/noise floor for at least 8 frames (~135ms) on mobile before starting recorder
+          // Require genuine close-mic voice above background song/noise floor for 5 frames (~80ms) on mobile before starting recorder
           if (normalized > dynamicVoiceThreshold && !isMusicDominated) {
             lastVoiceTime = now;
             startSpeechFrames++;
@@ -1415,7 +1428,7 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
             }
 
             if (
-              startSpeechFrames >= 8 &&
+              startSpeechFrames >= 5 &&
               recorder &&
               recorder.state === 'inactive' &&
               !isRecordingChunkRef.current &&
@@ -1440,13 +1453,14 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
             }
           }
 
-          // Mobile anti-infinite-capture guard:
-          // 1. Normal stop after SILENCE_SUBMIT_MS (1.2s) of silence
-          // 2. If recording has gone on for >3s (180 frames) with <8% natural syllable pauses, it's a continuous background song -> abort & discard immediately!
-          // 3. Hard cap at 9s per segment so the recorder can NEVER get stuck capturing forever!
+          // Mobile fast end-of-speech & anti-infinite-capture guard:
+          // 1. Snappy 780ms silence submit on mobile (since Whisper adds ~250ms network transcription time)
+          // 2. If recording has gone on for >2s (120 frames) with <7% natural syllable pauses, it's a continuous background song -> abort & discard immediately!
+          // 3. Hard cap at 6.5s per segment so the recorder can NEVER get stuck capturing forever!
           if (isRecordingChunkRef.current && recorder && recorder.state === 'recording') {
+            const mobileSilenceMs = 780;
             const isContinuousSongStream =
-              totalRecordingFramesCount > 180 && silentGapFramesCount / totalRecordingFramesCount < 0.08;
+              totalRecordingFramesCount > 120 && silentGapFramesCount / totalRecordingFramesCount < 0.07;
 
             if (isContinuousSongStream) {
               discardCurrentRecording = true;
@@ -1454,7 +1468,7 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
               try {
                 recorder.stop();
               } catch (_) {}
-            } else if (now - lastVoiceTime > SILENCE_SUBMIT_MS || now - recordingStartTime > 9000) {
+            } else if (now - lastVoiceTime > mobileSilenceMs || now - recordingStartTime > 6500) {
               try {
                 recorder.stop();
               } catch (_) {}
