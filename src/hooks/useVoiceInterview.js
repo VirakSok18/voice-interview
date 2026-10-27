@@ -171,6 +171,8 @@ export function useVoiceInterview() {
   const aiSpeechStartTimeRef = useRef(0);
   const currentAiTextRef = useRef('');
   const currentMicVolumeRef = useRef(0);
+  const ttsAudioCacheRef = useRef(new Map());
+  const isStartingOrStoppingRef = useRef(false);
   const rafIdRef = useRef(null);
   const transcriptAccumulatorRef = useRef('');
   const currentInterimRef = useRef('');
@@ -240,6 +242,18 @@ export function useVoiceInterview() {
                 micStreamRef.current = stream;
               })
               .catch(() => {});
+          }
+        })
+        .catch(() => {});
+      fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: CONVERSATIONAL_GREETING, voice: 'en-US-JennyNeural' })
+      })
+        .then(r => (r.ok ? r.arrayBuffer() : null))
+        .then(buf => {
+          if (buf && buf.byteLength > 300) {
+            ttsAudioCacheRef.current.set(`en-US-JennyNeural::${CONVERSATIONAL_GREETING.trim()}`, buf);
           }
         })
         .catch(() => {});
@@ -639,9 +653,16 @@ export function useVoiceInterview() {
     // so the subtitle never flashes prematurely or conflicts before the voice actually starts!
 
     // 0. Default Built-In Ultra-Fast Neural Voice (en-US-JennyNeural via /api/tts at 1.1x playback rate)
-    // Synthesizes the entire response in a single clean call (~0.6s) and shows each movie subtitle line ONLY at the exact millisecond the voice speaks it!
+    // Synthesizes the entire response in a single clean call (~0.6s) and caches the audio buffer in memory so resuming/repeating is 0ms instant!
     if (voiceProvider === 'neural' || voiceProvider === 'browser') {
       try {
+        const cacheKey = `${neuralVoice || 'en-US-JennyNeural'}::${text.trim()}`;
+        const cachedBuffer = ttsAudioCacheRef.current.get(cacheKey);
+        if (cachedBuffer && cachedBuffer.byteLength > 300 && isSessionActiveRef.current && isSpeakingRef.current) {
+          await playAudioBuffer(cachedBuffer.slice(0), text);
+          return;
+        }
+
         const response = await fetch('/api/tts', {
           method: 'POST',
           signal: controller.signal,
@@ -655,6 +676,11 @@ export function useVoiceInterview() {
         if (response.ok && isSessionActiveRef.current && isSpeakingRef.current) {
           const buffer = await response.arrayBuffer();
           if (buffer && buffer.byteLength > 300 && isSessionActiveRef.current && isSpeakingRef.current) {
+            if (ttsAudioCacheRef.current.size > 40) {
+              const oldestKey = ttsAudioCacheRef.current.keys().next().value;
+              ttsAudioCacheRef.current.delete(oldestKey);
+            }
+            ttsAudioCacheRef.current.set(cacheKey, buffer.slice(0));
             await playAudioBuffer(buffer, text);
             return;
           }
@@ -1417,48 +1443,75 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
     recognitionRef.current = recognition;
   }, [isMobileDevice, killAllVoiceOutput, submitCandidateAnswer]);
 
-  // Start or Resume Current Session
+  // Start or Resume Current Session (Protected against rapid spam clicks & instant 0ms resume from TTS cache!)
   const startInterview = async () => {
-    isSessionActiveRef.current = true;
-    isProcessingTurnRef.current = false;
+    if (isStartingOrStoppingRef.current || isSessionActiveRef.current) return;
+    isStartingOrStoppingRef.current = true;
 
-    await initializeAudioContext();
-    if (!isSessionActiveRef.current) return;
+    try {
+      isSessionActiveRef.current = true;
+      isProcessingTurnRef.current = false;
+      setStatus('thinking');
 
-    initializeSpeechRecognition();
-    clearSpeechBuffers();
+      await initializeAudioContext();
+      if (!isSessionActiveRef.current) return;
 
-    const savedTitle = customRoleTitleRef.current;
-    const savedPhase = interviewPhaseRef.current;
-    const savedHistory = historyRef.current;
+      initializeSpeechRecognition();
+      clearSpeechBuffers();
 
-    if (savedPhase === 'interviewing' && savedTitle && savedHistory.length > 0) {
-      const lastAiMsg = [...savedHistory].reverse().find(m => m.sender === 'ai');
-      const resumeGreeting = lastAiMsg
-        ? `Welcome back to your ${savedTitle} interview! ${lastAiMsg.text}`
-        : `Welcome back! Ready to continue your ${savedTitle} interview?`;
+      const savedTitle = customRoleTitleRef.current;
+      const savedPhase = interviewPhaseRef.current;
+      const savedHistory = historyRef.current;
 
-      setHistory(prev => [...prev, { sender: 'ai', text: resumeGreeting }]);
-      speakText(resumeGreeting);
-      return;
+      if (savedPhase === 'interviewing' && savedTitle && savedHistory.length > 0) {
+        const lastAiMsg = [...savedHistory].reverse().find(m => m.sender === 'ai');
+        const resumeText = lastAiMsg
+          ? lastAiMsg.text
+          : `Welcome back! Ready to continue your ${savedTitle} interview?`;
+
+        // Never append duplicate history entries if the last message in history is already this AI prompt!
+        if (!lastAiMsg) {
+          const updated = [...savedHistory, { sender: 'ai', text: resumeText }];
+          historyRef.current = updated;
+          setHistory(updated);
+        }
+
+        speakText(resumeText);
+        return;
+      }
+
+      setRole('undecided');
+      roleRef.current = 'undecided';
+      setCustomRoleTitle('');
+      customRoleTitleRef.current = '';
+      setInterviewPhase('greeting');
+      interviewPhaseRef.current = 'greeting';
+      setQuestionIndex(-1);
+      questionIndexRef.current = -1;
+
+      const welcome = CONVERSATIONAL_GREETING;
+      // Only set welcome in history if it's not already the only message
+      if (savedHistory.length !== 1 || savedHistory[0]?.text !== welcome) {
+        const initialHistory = [{ sender: 'ai', text: welcome }];
+        historyRef.current = initialHistory;
+        setHistory(initialHistory);
+      }
+      speakText(welcome);
+    } finally {
+      setTimeout(() => {
+        isStartingOrStoppingRef.current = false;
+      }, 280);
     }
-
-    setRole('undecided');
-    roleRef.current = 'undecided';
-    setCustomRoleTitle('');
-    customRoleTitleRef.current = '';
-    setInterviewPhase('greeting');
-    interviewPhaseRef.current = 'greeting';
-    setQuestionIndex(-1);
-    questionIndexRef.current = -1;
-
-    const welcome = CONVERSATIONAL_GREETING;
-    setHistory([{ sender: 'ai', text: welcome }]);
-    speakText(welcome);
   };
 
   // Stop Session
   const stopInterview = useCallback((destroyHardwareTracks = false) => {
+    if (isStartingOrStoppingRef.current && !destroyHardwareTracks) return;
+    isStartingOrStoppingRef.current = true;
+    setTimeout(() => {
+      isStartingOrStoppingRef.current = false;
+    }, 220);
+
     isSessionActiveRef.current = false;
     isSpeakingRef.current = false;
     isProcessingTurnRef.current = false;
