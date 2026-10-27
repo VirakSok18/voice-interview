@@ -1182,28 +1182,44 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
       // MediaRecorder fallback ONLY on mobile devices (where WebSpeech isn't used)
       let recorder = mediaRecorderRef.current;
       let activeVoiceFramesCount = 0;
+      let totalRecordingFramesCount = 0;
+      let silentGapFramesCount = 0;
       let isVerifyingBargeIn = false;
+      let discardCurrentRecording = false;
       if (isMobileDevice && !recorder && typeof window.MediaRecorder !== 'undefined') {
         try {
           recorder = new MediaRecorder(stream);
           mediaRecorderRef.current = recorder;
           recorder.ondataavailable = (e) => {
-            if (e.data && e.data.size > 0) {
+            if (e.data && e.data.size > 0 && !discardCurrentRecording) {
               audioChunksRef.current.push(e.data);
             }
           };
           recorder.onstop = async () => {
             const spokenFrames = activeVoiceFramesCount;
+            const totalFrames = totalRecordingFramesCount;
+            const gapFrames = silentGapFramesCount;
             const wasBargeInCheck = isVerifyingBargeIn;
+            const shouldDiscard = discardCurrentRecording;
             activeVoiceFramesCount = 0;
+            totalRecordingFramesCount = 0;
+            silentGapFramesCount = 0;
             isVerifyingBargeIn = false;
+            discardCurrentRecording = false;
             isRecordingChunkRef.current = false;
             const chunks = audioChunksRef.current;
             audioChunksRef.current = [];
-            if (!isSessionActiveRef.current || isProcessingTurnRef.current) return;
+            if (shouldDiscard || !isSessionActiveRef.current || isProcessingTurnRef.current) return;
 
-            // Require at least ~350ms (20 frames) of actual sustained human voice so brief clicks/taps/noises are ignored!
-            if (spokenFrames < 20) return;
+            // Require at least ~400ms (24 frames) of actual close-mic human voice
+            if (spokenFrames < 24) return;
+
+            // Syllabic speech vs. continuous background song check:
+            // If recording lasted >2.5s (150 frames) with almost zero natural syllable/word pauses (<8% gap frames),
+            // it's a continuous song/music stream in the background — reject it!
+            if (totalFrames > 150 && gapFrames / totalFrames < 0.08) {
+              return;
+            }
 
             if (chunks.length > 0) {
               const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
@@ -1259,6 +1275,8 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
       const analyser = analyserRef.current;
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
       let lastVoiceTime = 0;
+      let recordingStartTime = 0;
+      let continuousSoundFrames = 0;
       let bargeInFrames = 0;
       let startSpeechFrames = 0;
 
@@ -1301,19 +1319,32 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
         const normalized = isMusicDominated ? rawNormalized * 0.45 : rawNormalized;
         currentMicVolumeRef.current = normalized;
 
-        // Continuously adapt ambient noise/music floor (tracks background songs or cafe baseline up to 0.55)
+        // Continuously adapt ambient noise/music floor:
+        // On mobile phones (which have aggressive hardware AGC that boosts background songs),
+        // if sound stays continuously elevated without syllable gaps for >1.5s (90 frames), lock the noise floor directly onto the song!
         const currentFloor = ambientNoiseFloorRef.current;
+        if (normalized > currentFloor + 0.04) {
+          continuousSoundFrames++;
+        } else {
+          continuousSoundFrames = Math.max(0, continuousSoundFrames - 3);
+        }
+
         if (normalized < currentFloor) {
           ambientNoiseFloorRef.current = currentFloor * 0.92 + normalized * 0.08;
-        } else if (normalized < currentFloor + 0.22) {
-          // Adapt upward within ~2 seconds when background music/songs are playing continuously
-          ambientNoiseFloorRef.current = Math.min(0.55, currentFloor * 0.96 + normalized * 0.04);
+        } else if (isMobileDevice && continuousSoundFrames > 90) {
+          // Continuous song/music detected on mobile! Rapidly raise the floor to match the song so it stops capturing!
+          ambientNoiseFloorRef.current = Math.min(0.68, currentFloor * 0.88 + normalized * 0.12);
+        } else if (normalized < currentFloor + (isMobileDevice ? 0.32 : 0.22)) {
+          ambientNoiseFloorRef.current = Math.min(isMobileDevice ? 0.65 : 0.55, currentFloor * 0.96 + normalized * 0.04);
         }
 
         const now = Date.now();
-        // Dynamic voice threshold: user's close-up voice must rise clearly (+0.11) above the background song/cafe floor!
-        const dynamicVoiceThreshold = Math.max(0.14, ambientNoiseFloorRef.current + 0.11);
-        const dynamicBargeInThreshold = Math.max(0.19, ambientNoiseFloorRef.current + 0.14);
+        // Phone mics are much more sensitive than desktop mics, so require a higher close-mic vocal threshold on mobile!
+        const minVoiceGate = isMobileDevice ? 0.26 : 0.14;
+        const minBargeGate = isMobileDevice ? 0.32 : 0.19;
+        const floorMargin = isMobileDevice ? 0.15 : 0.11;
+        const dynamicVoiceThreshold = Math.max(minVoiceGate, ambientNoiseFloorRef.current + floorMargin);
+        const dynamicBargeInThreshold = Math.max(minBargeGate, ambientNoiseFloorRef.current + floorMargin + 0.04);
 
         if (normalized >= dynamicVoiceThreshold && !isMusicDominated) {
           lastVoiceSpikeAboveNoiseTimeRef.current = now;
@@ -1327,9 +1358,10 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
             bargeInFrames++;
             if (isRecordingChunkRef.current) {
               activeVoiceFramesCount++;
+              totalRecordingFramesCount++;
             }
             if (
-              bargeInFrames >= 12 &&
+              bargeInFrames >= 14 &&
               recorder &&
               recorder.state === 'inactive' &&
               !isRecordingChunkRef.current &&
@@ -1337,21 +1369,29 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
             ) {
               audioChunksRef.current = [];
               activeVoiceFramesCount = bargeInFrames;
+              totalRecordingFramesCount = bargeInFrames;
+              silentGapFramesCount = 0;
+              discardCurrentRecording = false;
               isVerifyingBargeIn = true;
               isRecordingChunkRef.current = true;
+              recordingStartTime = now;
               try {
                 recorder.start();
               } catch (_) {}
             }
           } else {
             bargeInFrames = Math.max(0, bargeInFrames - 1);
+            if (isRecordingChunkRef.current) {
+              totalRecordingFramesCount++;
+              silentGapFramesCount++;
+            }
             if (
               isMobileDevice &&
               isRecordingChunkRef.current &&
               isVerifyingBargeIn &&
               recorder &&
               recorder.state === 'recording' &&
-              now - lastVoiceTime > 650
+              (now - lastVoiceTime > 650 || now - recordingStartTime > 4500)
             ) {
               try {
                 recorder.stop();
@@ -1359,20 +1399,23 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
             }
           }
         } else {
-          // Only pulse the visual orb for voice above the background song/noise floor!
-          const visualLevel = Math.max(0, normalized - ambientNoiseFloorRef.current * 0.85);
+          // Only pulse the visual orb for voice clearly above the background song/noise floor!
+          const visualLevel = normalized > dynamicVoiceThreshold
+            ? Math.max(0, normalized - ambientNoiseFloorRef.current)
+            : 0;
           setAudioLevel(visualLevel);
 
-          // Require genuine close-mic voice above background song/noise floor for at least 6 frames (~100ms) before starting mobile recorder
+          // Require genuine close-mic voice above background song/noise floor for at least 8 frames (~135ms) on mobile before starting recorder
           if (normalized > dynamicVoiceThreshold && !isMusicDominated) {
             lastVoiceTime = now;
             startSpeechFrames++;
             if (isRecordingChunkRef.current) {
               activeVoiceFramesCount++;
+              totalRecordingFramesCount++;
             }
 
             if (
-              startSpeechFrames >= 6 &&
+              startSpeechFrames >= 8 &&
               recorder &&
               recorder.state === 'inactive' &&
               !isRecordingChunkRef.current &&
@@ -1380,19 +1423,38 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
             ) {
               audioChunksRef.current = [];
               activeVoiceFramesCount = startSpeechFrames;
+              totalRecordingFramesCount = startSpeechFrames;
+              silentGapFramesCount = 0;
+              discardCurrentRecording = false;
               isRecordingChunkRef.current = true;
+              recordingStartTime = now;
               try {
                 recorder.start();
               } catch (_) {}
             }
           } else {
             startSpeechFrames = Math.max(0, startSpeechFrames - 1);
-            if (
-              isRecordingChunkRef.current &&
-              recorder &&
-              recorder.state === 'recording' &&
-              now - lastVoiceTime > SILENCE_SUBMIT_MS
-            ) {
+            if (isRecordingChunkRef.current) {
+              totalRecordingFramesCount++;
+              silentGapFramesCount++;
+            }
+          }
+
+          // Mobile anti-infinite-capture guard:
+          // 1. Normal stop after SILENCE_SUBMIT_MS (1.2s) of silence
+          // 2. If recording has gone on for >3s (180 frames) with <8% natural syllable pauses, it's a continuous background song -> abort & discard immediately!
+          // 3. Hard cap at 9s per segment so the recorder can NEVER get stuck capturing forever!
+          if (isRecordingChunkRef.current && recorder && recorder.state === 'recording') {
+            const isContinuousSongStream =
+              totalRecordingFramesCount > 180 && silentGapFramesCount / totalRecordingFramesCount < 0.08;
+
+            if (isContinuousSongStream) {
+              discardCurrentRecording = true;
+              ambientNoiseFloorRef.current = Math.min(0.68, Math.max(ambientNoiseFloorRef.current, normalized + 0.06));
+              try {
+                recorder.stop();
+              } catch (_) {}
+            } else if (now - lastVoiceTime > SILENCE_SUBMIT_MS || now - recordingStartTime > 9000) {
               try {
                 recorder.stop();
               } catch (_) {}
