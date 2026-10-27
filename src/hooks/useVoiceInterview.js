@@ -171,6 +171,9 @@ export function useVoiceInterview() {
   const aiSpeechStartTimeRef = useRef(0);
   const currentAiTextRef = useRef('');
   const currentMicVolumeRef = useRef(0);
+  const ambientNoiseFloorRef = useRef(0.05);
+  const lastVoiceSpikeAboveNoiseTimeRef = useRef(0);
+  const hasFinishedCurrentPromptRef = useRef(false);
   const ttsAudioCacheRef = useRef(new Map());
   const isStartingOrStoppingRef = useRef(false);
   const rafIdRef = useRef(null);
@@ -504,6 +507,7 @@ export function useVoiceInterview() {
   const resumeListeningAfterAiSpeech = useCallback(() => {
     if (!isSessionActiveRef.current) return;
     isSpeakingRef.current = false;
+    hasFinishedCurrentPromptRef.current = true;
     setAudioLevel(0);
     setStatus('listening');
 
@@ -647,6 +651,7 @@ export function useVoiceInterview() {
     abortControllerRef.current = controller;
 
     isSpeakingRef.current = true;
+    hasFinishedCurrentPromptRef.current = false;
     aiSpeechStartTimeRef.current = Date.now();
     currentAiTextRef.current = text.toLowerCase();
     // Keep status as 'thinking' until the audio buffer is decoded and ready to play,
@@ -932,6 +937,17 @@ export function useVoiceInterview() {
     const currentQIndex = questionIndexRef.current;
     const currentHistory = historyRef.current;
 
+    // Allow user to ask the interviewer to repeat the question anytime
+    const wantsRepeatQuestion = /\b(repeat\s*(the\s*)?(question|that)|say\s*that\s*again|what\s*was\s*the\s*question|read\s*(it|the\s*question)\s*again|come\s*again)\b/i.test(cleanAnswer);
+    if (wantsRepeatQuestion && currentHistory.length > 0) {
+      const lastAiMsg = [...currentHistory].reverse().find(m => m.sender === 'ai');
+      if (lastAiMsg && lastAiMsg.text) {
+        isProcessingTurnRef.current = false;
+        speakText(lastAiMsg.text);
+        return;
+      }
+    }
+
     // Allow user to switch or reset role by voice anytime
     const wantsNewRole = /\b(switch\s*role|change\s*(role|position|job)|different\s*(role|position|job)|new\s*interview|start\s*over)\b/i.test(cleanAnswer);
     if (wantsNewRole) {
@@ -1205,22 +1221,42 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
         if (!analyserRef.current || !isSessionActiveRef.current) return;
         analyserRef.current.getByteFrequencyData(dataArray);
 
-        let sum = 0;
-        for (let i = 0; i < dataArray.length; i++) {
-          sum += dataArray[i];
+        // Focus on the human fundamental + formant vocal band (~250Hz to ~3400Hz)
+        // For fftSize=256 (128 bins at ~44.1kHz-48kHz), bins 2 through 22 isolate human voice while rejecting low AC/cafe rumble & high clinks!
+        let voiceBandSum = 0;
+        const startBin = 2;
+        const endBin = Math.min(22, dataArray.length - 1);
+        const binCount = Math.max(1, endBin - startBin + 1);
+        for (let i = startBin; i <= endBin; i++) {
+          voiceBandSum += dataArray[i];
         }
-        const average = sum / dataArray.length;
-        const normalized = Math.min(average / 128, 1);
+        const voiceAverage = voiceBandSum / binCount;
+        const normalized = Math.min(voiceAverage / 135, 1);
         currentMicVolumeRef.current = normalized;
 
-        const now = Date.now();
+        // Continuously adapt ambient noise floor (tracks quiet room or noisy cafe baseline)
+        // Drops quickly when room is quiet, rises slowly if sustained background ambiance is present
+        const currentFloor = ambientNoiseFloorRef.current;
+        if (normalized < currentFloor) {
+          ambientNoiseFloorRef.current = currentFloor * 0.92 + normalized * 0.08;
+        } else if (normalized < currentFloor + 0.12) {
+          ambientNoiseFloorRef.current = Math.min(0.32, currentFloor * 0.995 + normalized * 0.005);
+        }
 
-        // Only detect Barge-In via sustained human speech on mobile (where WebSpeech isn't running)
-        // Requires 24+ consecutive frames (~400ms) of strong close-mic human voice (>0.32) so speaker audio never interrupts!
+        const now = Date.now();
+        // Dynamic voice threshold: must rise clearly above the current room/cafe noise floor!
+        const dynamicVoiceThreshold = Math.max(0.11, ambientNoiseFloorRef.current + 0.08);
+        const dynamicBargeInThreshold = Math.max(0.16, ambientNoiseFloorRef.current + 0.11);
+
+        if (normalized >= dynamicVoiceThreshold) {
+          lastVoiceSpikeAboveNoiseTimeRef.current = now;
+        }
+
+        // Mobile Barge-In via sustained close-mic human speech above ambient noise floor
         if (isSpeakingRef.current) {
-          if (isMobileDevice && now - aiSpeechStartTimeRef.current > 1200 && normalized > 0.32) {
+          if (isMobileDevice && now - aiSpeechStartTimeRef.current > 900 && normalized > dynamicBargeInThreshold) {
             bargeInFrames++;
-            if (bargeInFrames >= 24) {
+            if (bargeInFrames >= 18) {
               bargeInFrames = 0;
               interruptAiSpeech(true);
               lastVoiceTime = now;
@@ -1239,8 +1275,8 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
         } else {
           setAudioLevel(normalized);
 
-          // Require genuine voice level (>0.14) for at least 6 frames (~100ms) before starting mobile recorder
-          if (normalized > 0.14) {
+          // Require genuine voice above ambient noise floor for at least 5 frames (~85ms) before starting mobile recorder
+          if (normalized > dynamicVoiceThreshold) {
             lastVoiceTime = now;
             startSpeechFrames++;
             if (isRecordingChunkRef.current) {
@@ -1248,7 +1284,7 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
             }
 
             if (
-              startSpeechFrames >= 6 &&
+              startSpeechFrames >= 5 &&
               recorder &&
               recorder.state === 'inactive' &&
               !isRecordingChunkRef.current &&
@@ -1340,8 +1376,7 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
       const incomingSpeech = (newlyFinal + ' ' + interim).trim();
 
       // If AI is currently speaking and user starts talking:
-      // Only interrupt when Web Speech recognizes an actual spoken phrase from the user (not speaker echo or room noise),
-      // so background noises, coughs, or speaker bleed from the AI's own voice NEVER cut off the AI mid-sentence!
+      // Always-on adaptive interruption: works in quiet rooms AND noisy cafes without needing any button press!
       if (isSpeakingRef.current) {
         const cleanWords = incomingSpeech
           .toLowerCase()
@@ -1349,23 +1384,31 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
           .split(/\s+/)
           .filter(w => w.length >= 2);
 
-        const isRealSpokenPhrase = cleanWords.length >= 3 || (cleanWords.length >= 2 && incomingSpeech.length >= 10);
+        const isRealSpokenPhrase = cleanWords.length >= 2 && incomingSpeech.length >= 6;
         if (!isRealSpokenPhrase) return;
 
-        // Require actual physical microphone volume above room/speaker bleed level
-        if (currentMicVolumeRef.current < 0.14) return;
+        // Require that the user's close-up voice spiked above the adaptive room/cafe noise floor within the last 1.4s
+        if (Date.now() - lastVoiceSpikeAboveNoiseTimeRef.current > 1400) return;
 
-        // Ignore if mic picked up a snippet or echo of the AI's own sentence (even with slightly different punctuation)
-        const cleanAiText = (currentAiTextRef.current || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ');
+        // Ignore if mic picked up a contiguous snippet or 2-word echo of the AI's own sentence
+        const cleanAiText = (currentAiTextRef.current || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
         const cleanIncoming = cleanWords.join(' ');
         if (cleanAiText.includes(cleanIncoming)) return;
 
-        const aiWordSet = new Set(cleanAiText.split(/\s+/).filter(Boolean));
-        const matchingAiWords = cleanWords.filter(w => aiWordSet.has(w)).length;
-        if (cleanWords.length > 0 && matchingAiWords / cleanWords.length >= 0.5) return;
+        if (cleanWords.length >= 2) {
+          let matchingBigrams = 0;
+          for (let i = 0; i < cleanWords.length - 1; i++) {
+            const bigram = `${cleanWords[i]} ${cleanWords[i + 1]}`;
+            if (cleanAiText.includes(bigram)) matchingBigrams++;
+          }
+          if (matchingBigrams > 0 && matchingBigrams >= Math.ceil((cleanWords.length - 1) * 0.5)) {
+            return;
+          }
+        }
 
         // Genuine spoken phrase from user! Stop AI voice immediately and capture user's new speech!
         killAllVoiceOutput();
+        hasFinishedCurrentPromptRef.current = true;
         setStatus('listening');
       }
 
@@ -1462,6 +1505,19 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
       const savedTitle = customRoleTitleRef.current;
       const savedPhase = interviewPhaseRef.current;
       const savedHistory = historyRef.current;
+
+      // If the interviewer ALREADY finished reading the current question/prompt before the user paused,
+      // go straight to Listening mode immediately (0ms) without re-reading the whole question out loud!
+      if (hasFinishedCurrentPromptRef.current && savedHistory.length > 0) {
+        const lastAiMsg = [...savedHistory].reverse().find(m => m.sender === 'ai');
+        if (lastAiMsg && lastAiMsg.text) {
+          const lines = splitIntoMovieLines(lastAiMsg.text);
+          setAiResponse(lines[lines.length - 1] || lastAiMsg.text);
+        }
+        isSpeakingRef.current = false;
+        setStatus('listening');
+        return;
+      }
 
       if (savedPhase === 'interviewing' && savedTitle && savedHistory.length > 0) {
         const lastAiMsg = [...savedHistory].reverse().find(m => m.sender === 'ai');
@@ -1571,6 +1627,7 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
     killAllVoiceOutput();
     clearSpeechBuffers();
     isProcessingTurnRef.current = false;
+    hasFinishedCurrentPromptRef.current = false;
 
     const fresh = createBlankSession();
     setSessions(prev => {
@@ -1611,6 +1668,7 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
     killAllVoiceOutput();
     clearSpeechBuffers();
     isProcessingTurnRef.current = false;
+    hasFinishedCurrentPromptRef.current = false;
 
     setActiveSessionId(target.id);
     setRole(target.role || 'undecided');
