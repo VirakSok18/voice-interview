@@ -119,9 +119,12 @@ export default function VoiceOrb({ status = 'idle', audioLevel = 0 }) {
     const scene = new THREE.Scene();
     scene.fog = new THREE.FogExp2(0x0a0c10, 0.08);
 
+    const initialWidth = Math.max(container.clientWidth || 0, 260);
+    const initialHeight = Math.max(container.clientHeight || 0, 260);
+
     const camera = new THREE.PerspectiveCamera(
       45,
-      container.clientWidth / container.clientHeight,
+      initialWidth / initialHeight,
       0.1,
       100
     );
@@ -132,9 +135,12 @@ export default function VoiceOrb({ status = 'idle', audioLevel = 0 }) {
       alpha: true,
       powerPreference: 'high-performance'
     });
-    renderer.setSize(container.clientWidth, container.clientHeight);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(initialWidth, initialHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     renderer.setClearColor(0x000000, 0);
+    renderer.domElement.style.width = '100%';
+    renderer.domElement.style.height = '100%';
+    renderer.domElement.style.display = 'block';
     container.appendChild(renderer.domElement);
 
     // Group for mouse parallax tilt
@@ -253,15 +259,17 @@ export default function VoiceOrb({ status = 'idle', audioLevel = 0 }) {
 
     window.addEventListener('pointermove', onPointerMove);
 
-    // Responsive Resize Handler
+    // Responsive Resize Handler + ResizeObserver so mobile first-open layout shifts NEVER leave the canvas at 0x0!
     const handleResize = () => {
       if (!container) return;
-      const width = container.clientWidth;
-      const height = container.clientHeight;
+      const width = container.clientWidth || container.offsetWidth || 260;
+      const height = container.clientHeight || container.offsetHeight || 260;
+      if (width <= 0 || height <= 0) return;
+
       camera.aspect = width / height;
       camera.updateProjectionMatrix();
       renderer.setSize(width, height);
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 
       // Dynamic scale adaptation based on screen width
       if (width < 640) {
@@ -272,7 +280,19 @@ export default function VoiceOrb({ status = 'idle', audioLevel = 0 }) {
     };
 
     window.addEventListener('resize', handleResize);
+    window.addEventListener('orientationchange', handleResize);
+
+    let resizeObserver = null;
+    if (typeof window !== 'undefined' && 'ResizeObserver' in window) {
+      resizeObserver = new ResizeObserver(() => {
+        handleResize();
+      });
+      resizeObserver.observe(container);
+    }
+
     handleResize();
+    const delayedResize1 = setTimeout(handleResize, 60);
+    const delayedResize2 = setTimeout(handleResize, 250);
 
     // Animation Loop
     let animationFrameId;
@@ -404,8 +424,12 @@ export default function VoiceOrb({ status = 'idle', audioLevel = 0 }) {
     // Cleanup on unmount
     return () => {
       cancelAnimationFrame(animationFrameId);
+      clearTimeout(delayedResize1);
+      clearTimeout(delayedResize2);
+      if (resizeObserver) resizeObserver.disconnect();
       window.removeEventListener('pointermove', onPointerMove);
       window.removeEventListener('resize', handleResize);
+      window.removeEventListener('orientationchange', handleResize);
       if (container && renderer.domElement) {
         container.removeChild(renderer.domElement);
       }

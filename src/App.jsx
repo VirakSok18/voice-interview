@@ -223,7 +223,7 @@ export default function App() {
           if (e.key === 'Enter' || e.key === ' ') handleOrbClick();
         }}
         aria-label={isSessionActive ? 'Tap bubble to stop voice' : 'Tap bubble to start talking'}
-        className="relative z-10 w-full max-w-[270px] sm:max-w-[380px] max-h-[46dvh] aspect-square flex items-center justify-center cursor-pointer transition-transform duration-300 active:scale-95 shrink-0"
+        className="relative z-10 w-[260px] h-[260px] sm:w-[360px] sm:h-[360px] max-w-[78vw] max-h-[44dvh] aspect-square flex items-center justify-center cursor-pointer transition-transform duration-300 active:scale-95 shrink-0"
       >
         <VoiceOrb status={status} audioLevel={audioLevel} />
       </div>
