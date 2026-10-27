@@ -1175,22 +1175,25 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
       // MediaRecorder fallback ONLY on mobile devices (where WebSpeech isn't used)
       let recorder = mediaRecorderRef.current;
       let activeVoiceFramesCount = 0;
+      let isVerifyingBargeIn = false;
       if (isMobileDevice && !recorder && typeof window.MediaRecorder !== 'undefined') {
         try {
           recorder = new MediaRecorder(stream);
           mediaRecorderRef.current = recorder;
           recorder.ondataavailable = (e) => {
-            if (e.data && e.data.size > 0 && !isSpeakingRef.current) {
+            if (e.data && e.data.size > 0) {
               audioChunksRef.current.push(e.data);
             }
           };
           recorder.onstop = async () => {
             const spokenFrames = activeVoiceFramesCount;
+            const wasBargeInCheck = isVerifyingBargeIn;
             activeVoiceFramesCount = 0;
+            isVerifyingBargeIn = false;
             isRecordingChunkRef.current = false;
             const chunks = audioChunksRef.current;
             audioChunksRef.current = [];
-            if (!isSessionActiveRef.current || isProcessingTurnRef.current || isSpeakingRef.current) return;
+            if (!isSessionActiveRef.current || isProcessingTurnRef.current) return;
 
             // Require at least ~350ms (20 frames) of actual sustained human voice so brief clicks/taps/noises are ignored!
             if (spokenFrames < 20) return;
@@ -1198,10 +1201,47 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
             if (chunks.length > 0) {
               const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
               const whisperText = await transcribeAudioWithWhisper(blob);
-              if (whisperText && isSessionActiveRef.current && !isProcessingTurnRef.current && !isSpeakingRef.current) {
+              if (!whisperText || !isSessionActiveRef.current || isProcessingTurnRef.current) return;
+
+              // If the AI was speaking while this mobile audio was recorded, verify it's a real user phrase (not noise or AI echo!) before interrupting!
+              if (isSpeakingRef.current || wasBargeInCheck) {
+                const cleanWords = whisperText
+                  .toLowerCase()
+                  .replace(/[^a-z0-9\s]/g, ' ')
+                  .split(/\s+/)
+                  .filter(w => w.length >= 2);
+
+                if (cleanWords.length < 2 || whisperText.trim().length < 6) return;
+
+                const cleanAiText = (currentAiTextRef.current || '')
+                  .toLowerCase()
+                  .replace(/[^a-z0-9\s]/g, ' ')
+                  .replace(/\s+/g, ' ')
+                  .trim();
+                const cleanIncoming = cleanWords.join(' ');
+                if (cleanAiText.includes(cleanIncoming)) return;
+
+                if (cleanWords.length >= 2) {
+                  let matchingBigrams = 0;
+                  for (let i = 0; i < cleanWords.length - 1; i++) {
+                    const bigram = `${cleanWords[i]} ${cleanWords[i + 1]}`;
+                    if (cleanAiText.includes(bigram)) matchingBigrams++;
+                  }
+                  if (matchingBigrams > 0 && matchingBigrams >= Math.ceil((cleanWords.length - 1) * 0.5)) {
+                    return;
+                  }
+                }
+
+                // Confirmed genuine spoken phrase on mobile! Stop AI voice and process the user's interruption!
+                killAllVoiceOutput();
+                hasFinishedCurrentPromptRef.current = true;
                 setTranscript(whisperText);
                 submitCandidateAnswer(whisperText);
+                return;
               }
+
+              setTranscript(whisperText);
+              submitCandidateAnswer(whisperText);
             }
           };
         } catch (e) {
@@ -1252,25 +1292,44 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
           lastVoiceSpikeAboveNoiseTimeRef.current = now;
         }
 
-        // Mobile Barge-In via sustained close-mic human speech above ambient noise floor
+        // Mobile Barge-In: NEVER kill AI voice on raw volume alone (which could be a cough, tap, cafe noise, or phone speaker bleed)!
+        // Instead, record the candidate speech while AI continues speaking, and only interrupt once Whisper confirms a real 2+ word phrase!
         if (isSpeakingRef.current) {
-          if (isMobileDevice && now - aiSpeechStartTimeRef.current > 900 && normalized > dynamicBargeInThreshold) {
+          if (isMobileDevice && now - aiSpeechStartTimeRef.current > 800 && normalized > dynamicBargeInThreshold) {
+            lastVoiceTime = now;
             bargeInFrames++;
-            if (bargeInFrames >= 18) {
-              bargeInFrames = 0;
-              interruptAiSpeech(true);
-              lastVoiceTime = now;
-              if (recorder && recorder.state === 'inactive' && !isRecordingChunkRef.current) {
-                audioChunksRef.current = [];
-                activeVoiceFramesCount = 10;
-                isRecordingChunkRef.current = true;
-                try {
-                  recorder.start();
-                } catch (_) {}
-              }
+            if (isRecordingChunkRef.current) {
+              activeVoiceFramesCount++;
+            }
+            if (
+              bargeInFrames >= 12 &&
+              recorder &&
+              recorder.state === 'inactive' &&
+              !isRecordingChunkRef.current &&
+              !isProcessingTurnRef.current
+            ) {
+              audioChunksRef.current = [];
+              activeVoiceFramesCount = bargeInFrames;
+              isVerifyingBargeIn = true;
+              isRecordingChunkRef.current = true;
+              try {
+                recorder.start();
+              } catch (_) {}
             }
           } else {
             bargeInFrames = Math.max(0, bargeInFrames - 1);
+            if (
+              isMobileDevice &&
+              isRecordingChunkRef.current &&
+              isVerifyingBargeIn &&
+              recorder &&
+              recorder.state === 'recording' &&
+              now - lastVoiceTime > 650
+            ) {
+              try {
+                recorder.stop();
+              } catch (_) {}
+            }
           }
         } else {
           setAudioLevel(normalized);
