@@ -453,7 +453,7 @@ export function useVoiceInterview() {
     return null;
   }, [groqKey]);
 
-  // Transcribe recorded audio blob using Groq Whisper with strict hallucination & noise rejection!
+  // Transcribe recorded audio blob using Groq Whisper with strict hallucination, background music & noise rejection!
   const transcribeAudioWithWhisper = useCallback(async (audioBlob) => {
     if (!groqKey.trim() || !audioBlob || audioBlob.size < 4500 || !isSessionActiveRef.current) return '';
     try {
@@ -477,20 +477,27 @@ export function useVoiceInterview() {
         const data = await res.json();
         const text = (data.text || '').trim();
 
-        // Check Whisper's built-in no_speech_prob and avg_logprob on segments so background noise is 100% rejected!
+        // Check Whisper's built-in no_speech_prob, avg_logprob, and compression_ratio so background music & noise are 100% rejected!
         if (Array.isArray(data.segments) && data.segments.length > 0) {
           const avgNoSpeech =
             data.segments.reduce((acc, s) => acc + (s.no_speech_prob || 0), 0) / data.segments.length;
           const avgLogProb =
             data.segments.reduce((acc, s) => acc + (s.avg_logprob || 0), 0) / data.segments.length;
-          if (avgNoSpeech > 0.45 || avgLogProb < -0.85) {
+          const maxCompression =
+            Math.max(...data.segments.map(s => s.compression_ratio || 1));
+          if (avgNoSpeech > 0.35 || avgLogProb < -0.68 || maxCompression > 2.1) {
             return '';
           }
         }
 
-        // Filter out common Whisper silence/background noise hallucinations
+        // Reject music notes, bracketed audio tags ([Music], (singing), ♪), and repetitive song lyric loops
+        if (/[♪♫♬♩]|\[.*?(music|singing|song|applause|laughter|instrumental|audio).*?\]|\(.*?(music|singing|song|instrumental).*?\)/i.test(text)) {
+          return '';
+        }
+
+        // Filter out common Whisper silence/background music/noise hallucinations
         const hallucinationRegex =
-          /^(thank\s*you\.?|thanks\s*for\s*watching\.?|please\s*subscribe\.?|like\s*and\s*subscribe\.?|you\.?|bye\.?|okay\.?|oh\.?|uh\.?|um\.?|hmm\.?|ah\.?|huh\.?|yeah\.?|yes\.?|no\.?|so\.?|well\.?|the\.?|i\.?|and\.?|subtitles\s*by.*|translated\s*by.*|amara\.org.*|www\..*|\W+)$/i;
+          /^(thank\s*you\.?|thanks\s*for\s*watching\.?|please\s*subscribe\.?|like\s*and\s*subscribe\.?|you\.?|bye\.?|okay\.?|oh\.?|uh\.?|um\.?|hmm\.?|ah\.?|huh\.?|yeah\.?|yes\.?|no\.?|so\.?|well\.?|the\.?|i\.?|and\.?|la\s+la.*|na\s+na.*|ooh.*|subtitles\s*by.*|translated\s*by.*|amara\.org.*|www\..*|\W+)$/i;
 
         if (text.length < 3 || hallucinationRegex.test(text)) {
           return '';
@@ -1261,41 +1268,61 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
         if (!analyserRef.current || !isSessionActiveRef.current) return;
         analyserRef.current.getByteFrequencyData(dataArray);
 
-        // Focus on the human fundamental + formant vocal band (~250Hz to ~3400Hz)
-        // For fftSize=256 (128 bins at ~44.1kHz-48kHz), bins 2 through 22 isolate human voice while rejecting low AC/cafe rumble & high clinks!
+        // Separate close-up human speech from background music/songs:
+        // 1. Sub-bass & bass drums (bins 0-1, <200Hz): high in music/songs, low in close-up speech
+        // 2. Core human vocal formants (bins 3-18, ~300Hz-3100Hz): dominant when user speaks into mic
+        // 3. High-frequency instruments/cymbals (bins 24-60, >4000Hz): high in background music
+        const subBassAvg = (dataArray[0] + dataArray[1]) / 2;
+
         let voiceBandSum = 0;
-        const startBin = 2;
-        const endBin = Math.min(22, dataArray.length - 1);
+        const startBin = 3;
+        const endBin = Math.min(18, dataArray.length - 1);
         const binCount = Math.max(1, endBin - startBin + 1);
         for (let i = startBin; i <= endBin; i++) {
           voiceBandSum += dataArray[i];
         }
         const voiceAverage = voiceBandSum / binCount;
-        const normalized = Math.min(voiceAverage / 135, 1);
+
+        let highMusicSum = 0;
+        const highStart = 24;
+        const highEnd = Math.min(56, dataArray.length - 1);
+        const highCount = Math.max(1, highEnd - highStart + 1);
+        for (let i = highStart; i <= highEnd; i++) {
+          highMusicSum += dataArray[i];
+        }
+        const highMusicAvg = highMusicSum / highCount;
+
+        // If sub-bass or high-frequency instrumentals dominate relative to vocal mids, it's background music/noise — attenuate it!
+        const isMusicDominated =
+          (subBassAvg > voiceAverage * 1.35 && voiceAverage < 115) ||
+          (highMusicAvg > voiceAverage * 0.85 && voiceAverage < 110);
+
+        const rawNormalized = Math.min(voiceAverage / 135, 1);
+        const normalized = isMusicDominated ? rawNormalized * 0.45 : rawNormalized;
         currentMicVolumeRef.current = normalized;
 
-        // Continuously adapt ambient noise floor (tracks quiet room or noisy cafe baseline)
-        // Drops quickly when room is quiet, rises slowly if sustained background ambiance is present
+        // Continuously adapt ambient noise/music floor (tracks background songs or cafe baseline up to 0.55)
         const currentFloor = ambientNoiseFloorRef.current;
         if (normalized < currentFloor) {
           ambientNoiseFloorRef.current = currentFloor * 0.92 + normalized * 0.08;
-        } else if (normalized < currentFloor + 0.12) {
-          ambientNoiseFloorRef.current = Math.min(0.32, currentFloor * 0.995 + normalized * 0.005);
+        } else if (normalized < currentFloor + 0.22) {
+          // Adapt upward within ~2 seconds when background music/songs are playing continuously
+          ambientNoiseFloorRef.current = Math.min(0.55, currentFloor * 0.96 + normalized * 0.04);
         }
 
         const now = Date.now();
-        // Dynamic voice threshold: must rise clearly above the current room/cafe noise floor!
-        const dynamicVoiceThreshold = Math.max(0.11, ambientNoiseFloorRef.current + 0.08);
-        const dynamicBargeInThreshold = Math.max(0.16, ambientNoiseFloorRef.current + 0.11);
+        // Dynamic voice threshold: user's close-up voice must rise clearly (+0.11) above the background song/cafe floor!
+        const dynamicVoiceThreshold = Math.max(0.14, ambientNoiseFloorRef.current + 0.11);
+        const dynamicBargeInThreshold = Math.max(0.19, ambientNoiseFloorRef.current + 0.14);
 
-        if (normalized >= dynamicVoiceThreshold) {
+        if (normalized >= dynamicVoiceThreshold && !isMusicDominated) {
           lastVoiceSpikeAboveNoiseTimeRef.current = now;
         }
 
         // Mobile Barge-In: NEVER kill AI voice on raw volume alone (which could be a cough, tap, cafe noise, or phone speaker bleed)!
         // Instead, record the candidate speech while AI continues speaking, and only interrupt once Whisper confirms a real 2+ word phrase!
         if (isSpeakingRef.current) {
-          if (isMobileDevice && now - aiSpeechStartTimeRef.current > 800 && normalized > dynamicBargeInThreshold) {
+          if (isMobileDevice && now - aiSpeechStartTimeRef.current > 800 && normalized > dynamicBargeInThreshold && !isMusicDominated) {
             lastVoiceTime = now;
             bargeInFrames++;
             if (isRecordingChunkRef.current) {
@@ -1332,10 +1359,12 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
             }
           }
         } else {
-          setAudioLevel(normalized);
+          // Only pulse the visual orb for voice above the background song/noise floor!
+          const visualLevel = Math.max(0, normalized - ambientNoiseFloorRef.current * 0.85);
+          setAudioLevel(visualLevel);
 
-          // Require genuine voice above ambient noise floor for at least 5 frames (~85ms) before starting mobile recorder
-          if (normalized > dynamicVoiceThreshold) {
+          // Require genuine close-mic voice above background song/noise floor for at least 6 frames (~100ms) before starting mobile recorder
+          if (normalized > dynamicVoiceThreshold && !isMusicDominated) {
             lastVoiceTime = now;
             startSpeechFrames++;
             if (isRecordingChunkRef.current) {
@@ -1343,7 +1372,7 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
             }
 
             if (
-              startSpeechFrames >= 5 &&
+              startSpeechFrames >= 6 &&
               recorder &&
               recorder.state === 'inactive' &&
               !isRecordingChunkRef.current &&
@@ -1422,8 +1451,8 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
       for (let i = event.resultIndex; i < event.results.length; ++i) {
         const alt = event.results[i][0];
         if (event.results[i].isFinal) {
-          // Ignore low-confidence background noise guesses from Chrome WebSpeech
-          if (typeof alt.confidence === 'number' && alt.confidence > 0 && alt.confidence < 0.45) {
+          // Ignore low-confidence background music/noise guesses from Chrome WebSpeech (distant song lyrics have lower confidence than close-mic speech)
+          if (typeof alt.confidence === 'number' && alt.confidence > 0 && alt.confidence < 0.68) {
             continue;
           }
           newlyFinal += alt.transcript + ' ';
@@ -1433,6 +1462,11 @@ Keep your total response to 3 to 4 spoken sentences maximum so it flows naturall
       }
 
       const incomingSpeech = (newlyFinal + ' ' + interim).trim();
+
+      // Reject distant background music/songs when the user hasn't actually spoken into the microphone above the room's music floor!
+      if (Date.now() - lastVoiceSpikeAboveNoiseTimeRef.current > 2200) {
+        return;
+      }
 
       // If AI is currently speaking and user starts talking:
       // Always-on adaptive interruption: works in quiet rooms AND noisy cafes without needing any button press!
